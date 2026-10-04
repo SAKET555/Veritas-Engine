@@ -652,7 +652,8 @@ The harness options are `--methods A1,A2,B,B2`, `--scale N` (a longer history), 
 - Packer, C., et al. (2023). *MemGPT: Towards LLMs as Operating Systems*. arXiv:2310.08560.
 - Pearl, J. (1988). *Probabilistic Reasoning in Intelligent Systems*. Morgan Kaufmann. (Noisy-OR combination.)
 - Rasmussen, P., et al. (2025). *Zep: A Temporal Knowledge Graph Architecture for Agent Memory*. arXiv:2501.13956.
-  (Graphiti.)
+  Graphiti, the open-source implementation, is at https://github.com/getzep/graphiti. **This is the primary prior work
+  VERITAS builds on.** VERITAS is an independent implementation and uses none of its code.
 - Snodgrass, R. T. (1999). *Developing Time-Oriented Database Applications in SQL*. Morgan Kaufmann.
 
 **Software:**

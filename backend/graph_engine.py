@@ -1,5 +1,11 @@
 """Bi-temporal graph engine built on ``networkx.MultiDiGraph``.
 
+The bi-temporal fact model (valid time + system time, superseded facts closed
+rather than deleted) follows Graphiti / Zep — Rasmussen et al., 2025,
+"Zep: A Temporal Knowledge Graph Architecture for Agent Memory",
+arXiv:2501.13956, https://github.com/getzep/graphiti — and the temporal-database
+literature (Snodgrass, 1999). This is an independent implementation.
+
 Design notes
 ------------
 * Every fact is an edge keyed by its UUID, so parallel facts between the same

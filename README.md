@@ -12,6 +12,29 @@ observation ─► extraction ─► reconciliation (R1–R5) ─► graph (vali
 question ─► seed resolution ─► k-hop ego ─► score/prune ─► compact context + audit trail ─► frozen LLM ─► citation check
 ```
 
+## Prior work and credits
+
+The central idea is **not new**. It comes from **Graphiti**, the open-source temporal knowledge graph behind
+**Zep's** agent memory:
+
+- Rasmussen, P., et al. (2025). *Zep: A Temporal Knowledge Graph Architecture for Agent Memory*. arXiv:2501.13956.
+- Graphiti: https://github.com/getzep/graphiti
+
+That idea is to store agent memory as a knowledge graph whose facts carry validity intervals (valid time) and
+ingestion times (system time), and to close superseded facts instead of deleting them.
+
+VERITAS is an **independent implementation written from scratch**. No Graphiti or Zep code is used. It builds on that
+idea with:
+
+- deterministic, authority-weighted conflict rules instead of LLM-decided edge invalidation;
+- a SHA-256 hash-chained, replayable audit ledger;
+- confidence-driven subgraph pruning;
+- post-generation verification of the model's citations against the ledger;
+- an evaluation harness and A/B Lab focused on small local models.
+
+The bi-temporal model itself comes from temporal-database research (Snodgrass, 1999; Jensen & Snodgrass, 1999). See
+[TECHNICAL.md](TECHNICAL.md) for the full reference list.
+
 ## Layout
 
 | Path | Purpose |
