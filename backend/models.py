@@ -281,8 +281,10 @@ class QueryRequest(_UTCModel):
     seed_entities: Optional[list[str]] = None
     as_of: Optional[datetime] = None
     pruning: PruningParams = Field(default_factory=PruningParams)
+    # Standard stays the default: on llama3.2-3B compact cut prompt tokens ~73% and latency ~3.5x
+    # but lost accuracy (90.9% → 75.8% over 132 graded answers), so it is opt-in.
     prompt_style: PromptStyle = Field(
-        default="compact",
+        default="standard",
         description="compact: short instructions + [n] citation tags (ledger-mapped server-side); "
         "standard: full M:id citations plus the rationale audit trail in the prompt",
     )

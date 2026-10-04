@@ -7,6 +7,8 @@ import {
   GitBranch,
   Loader2,
   MessageSquarePlus,
+  FlaskConical,
+  Network,
   RotateCcw,
   ScrollText,
   Sparkles,
@@ -19,6 +21,7 @@ import NodeInspector from "./components/NodeInspector.jsx";
 import ObservePanel from "./components/ObservePanel.jsx";
 import QueryPanel from "./components/QueryPanel.jsx";
 import QueryResults from "./components/QueryResults.jsx";
+import ABLab from "./lab/ABLab.jsx";
 
 function Stat({ label, value, tone = "text-slate-100" }) {
   return (
@@ -41,6 +44,7 @@ export default function App() {
   const [queryResult, setQueryResult] = useState(null);
   const [highlightedMutations, setHighlightedMutations] = useState(new Set());
   const [tab, setTab] = useState("console");
+  const [view, setView] = useState("graph");
   const [revision, setRevision] = useState(0);
   const [loadingGraph, setLoadingGraph] = useState(false);
   const [busy, setBusy] = useState(null);
@@ -143,6 +147,23 @@ export default function App() {
           <Stat label="ledger" value={health?.ledger_records} tone="text-sky-400" />
           <Stat label="frozen LLM" value={health?.llm_model} tone="text-violet-300" />
         </div>
+        <nav className="flex rounded-lg bg-slate-950/70 p-0.5 ring-1 ring-slate-800">
+          {[
+            ["graph", "Knowledge graph", Network],
+            ["lab", "A/B Lab", FlaskConical],
+          ].map(([key, label, Icon]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setView(key)}
+              className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                view === key ? "bg-slate-800 text-slate-100" : "text-slate-500 hover:text-slate-300"
+              }`}
+            >
+              <Icon className="h-3.5 w-3.5" /> {label}
+            </button>
+          ))}
+        </nav>
         <div className="ml-auto flex gap-2">
           <button type="button" className="btn-ghost" onClick={() => runAdmin("seed")} disabled={!!busy}>
             {busy === "seed" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
@@ -161,6 +182,9 @@ export default function App() {
         </div>
       )}
 
+      {view === "lab" && <ABLab />}
+
+      {view === "graph" && (
       <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[minmax(0,1fr)_420px]">
         <div className="flex min-h-0 flex-col gap-3">
           <div className="panel relative h-[58vh] min-h-[420px] overflow-hidden">
@@ -253,7 +277,9 @@ export default function App() {
         </aside>
       </div>
 
-      {queryResult && <QueryResults result={queryResult} onCitationClick={focusCitation} />}
+      )}
+
+      {view === "graph" && queryResult && <QueryResults result={queryResult} onCitationClick={focusCitation} />}
     </div>
   );
 }

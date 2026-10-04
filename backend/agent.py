@@ -48,18 +48,19 @@ Rules:
 4. If the context does not contain the answer, reply exactly: INSUFFICIENT_CONTEXT: <what is missing>.
 5. Be concise: at most 4 sentences."""
 
-SYSTEM_PROMPT_COMPACT = """Answer using ONLY the facts below. Lines marked "past" are no longer true; use them only \
-for questions about the past. Cite the [n] tag of every fact you use. If the facts do not answer the question, \
-reply ANSWER: UNKNOWN.
-Reply exactly:
-ANSWER: <short value>
-EXPLANATION: <one sentence with [n] tags>"""
+# Wording measured on llama3.2-3B: no "[n]" placeholder (it gets copied literally) and the
+# abstain clause last, so it reads as a fallback rather than an invitation.
+SYSTEM_PROMPT_COMPACT = """Answer the question using only the numbered facts below. A fact marked ENDED is no longer true.
+Reply in exactly this format:
+ANSWER: <short answer>
+EXPLANATION: <one sentence citing fact numbers like [1]>
+If no fact is about the question, write ANSWER: UNKNOWN."""
 
 # Prompt-local tags in compact style: "[2]", "[1, 3]", "[1][3]".
 _ALIAS_RE = re.compile(r"\[(\d{1,3}(?:\s*,\s*\d{1,3})*)\]")
 _COMPACT_FACT_RE = re.compile(
     r"^\[(?P<n>\d+)\] (?P<s>.+?) -(?P<p>[a-z0-9_]+)-> (?P<o>.+?) "
-    r"\((?:since (?P<f>[\d-]+)|past: (?P<pf>[\d-]+) to (?P<pt>[\d-]+)(?:, replaced by (?P<r>.+?))?)\)$"
+    r"\((?:since (?P<f>[\d-]+)|ENDED (?P<pt>[\d-]+), was true from (?P<pf>[\d-]+)(?:; replaced by (?P<r>.+?))?)\)$"
 )
 # Tolerant of small-model formatting drift: "[M:ab12cd34]", "M: AB12CD34", "(M:ab12cd34)".
 _CITATION_RE = re.compile(r"M:\s*([0-9a-fA-F]{8})\b")

@@ -1,30 +1,49 @@
 import { useMemo, useState } from "react";
 import { BadgeCheck, Bot, ChevronDown, ChevronRight, FileText, Gauge, ShieldAlert } from "lucide-react";
 
-const CITATION_SPLIT = /(\[M:[0-9a-f]{8}\])/g;
+// Standard style cites "[M:ab12cd34]"; compact style cites prompt-local tags "[2]" / "[1, 3]".
+const CITATION_SPLIT = /(\[M:[0-9a-f]{8}\]|\[\d{1,3}(?:,\s*\d{1,3})*\])/g;
+
+function CitationChip({ cite, label, onClick }) {
+  const ok = cite?.verified;
+  return (
+    <button
+      type="button"
+      onClick={() => cite && onClick(cite.short_id)}
+      title={cite?.rationale || "Not found in the ledger"}
+      className={`chip mx-0.5 align-middle ${
+        ok ? "bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25" : "bg-rose-500/20 text-rose-300"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
 
 function AnswerText({ text, citations, onCitationClick }) {
   const byId = useMemo(() => Object.fromEntries(citations.map((c) => [c.short_id, c])), [citations]);
+  const byAlias = useMemo(
+    () => Object.fromEntries(citations.filter((c) => c.alias).map((c) => [c.alias, c])),
+    [citations],
+  );
   return (
-    <p className="text-sm leading-relaxed text-slate-200">
+    <p className="whitespace-pre-line text-sm leading-relaxed text-slate-200">
       {text.split(CITATION_SPLIT).map((part, i) => {
         const m = part.match(/^\[M:([0-9a-f]{8})\]$/);
-        if (!m) return <span key={i}>{part}</span>;
-        const cite = byId[m[1]];
-        const ok = cite?.verified;
-        return (
-          <button
-            key={i}
-            type="button"
-            onClick={() => onCitationClick(m[1])}
-            title={cite?.rationale || "Unknown mutation"}
-            className={`chip mx-0.5 align-middle ${
-              ok ? "bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25" : "bg-rose-500/20 text-rose-300"
-            }`}
-          >
-            M:{m[1]}
-          </button>
-        );
+        if (m) return <CitationChip key={i} cite={byId[m[1]]} label={`M:${m[1]}`} onClick={onCitationClick} />;
+        const tags = part.match(/^\[(\d{1,3}(?:,\s*\d{1,3})*)\]$/);
+        if (!tags) return <span key={i}>{part}</span>;
+        return tags[1].split(",").map((t) => {
+          const cite = byAlias[t.trim()];
+          return (
+            <CitationChip
+              key={`${i}-${t}`}
+              cite={cite}
+              label={cite ? `[${t.trim()}] M:${cite.short_id}` : `[${t.trim()}]`}
+              onClick={onCitationClick}
+            />
+          );
+        });
       })}
     </p>
   );

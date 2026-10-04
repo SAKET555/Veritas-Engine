@@ -109,7 +109,54 @@ LLM_PROVIDER=ollama LLM_MODEL=llama3.2 uvicorn main:app --port 8000
   The dashboard shows these under **Token efficiency**.
 - For a llama.cpp `llama-server`, set `LLM_PROVIDER=llamacpp` and `LLM_BASE_URL=http://localhost:8080/v1`.
 
-### A/B evaluation: append-only history vs vector RAG vs VERITAS
+### A/B Lab (in the dashboard)
+
+Open the dashboard and switch to **A/B Lab** in the header.
+
+1. **Facts:** enter facts in the order an agent learns them. You can type them, paste lines (`[2026-01-05] Priya lives
+   in Pune`), import everything you observed on the Graph page, or load the demo. Each fact can have an optional time,
+   a source and a confidence.
+2. **Questions:** write test questions, or click **Auto-generate from my facts**. This builds "what is it now", "what
+   was it before" and stable-control questions, taking the correct answers from VERITAS's reconciliation of your facts.
+   Review them before running.
+3. **Run:** pick a local model (from `ollama list`), CPU-only if you like, the number of repeats and the methods, then
+   run.
+
+Results stream in live as side-by-side bars for accuracy, accuracy on changed facts, prompt tokens, median latency,
+stale answers and verified citations. A table shows every answer; click a cell to see the exact prompt and reply.
+
+Runs execute one at a time in the backend and are saved to `backend/reports/lab_*`.
+
+### Compact prompt (opt-in)
+
+`QueryRequest.prompt_style` is `standard` by default. `compact` sends the same pruned facts, written for a small
+model:
+
+- **Short instructions.**
+- **`[1]`-style citation tags.** The server maps each tag back to its ledger mutation ID and verifies it, so citations
+  stay tamper-evident.
+- **`ENDED … replaced by X` notes** on old facts.
+- **No rationale text.** The rationale stays in the ledger instead of the prompt.
+
+Measured on llama3.2-3B (CPU, 11 questions × 3 repeats = 33 graded answers per method):
+
+| | Accuracy | Prompt tokens | Median latency |
+|---|---|---|---|
+| A1 full history | 81.8% | 1,756 | 21.2 s |
+| A2 vector RAG | 54.5% | 258 | 4.5 s |
+| B VERITAS standard | **90.9%** | 562 | 8.2 s |
+| B2 VERITAS compact | 75.8% | **149** | **2.4 s** |
+
+Compact is 3.5 times faster than standard and uses 73% fewer tokens, but it does **not** keep standard's accuracy on
+this 3B model. The model sometimes answers UNKNOWN when it is given only one or two facts. That is why standard stays
+the default. Measured wording lessons, recorded in the code:
+
+- A header that defined "past" made the model treat every fact as no longer true.
+- A `[n]` placeholder in the instructions got copied literally.
+- Writing relations as plain sentences scored worse (65%) than `-relation->` arrows (88%) across three separate fact
+  sets.
+
+### A/B evaluation from the command line: append-only history vs vector RAG vs VERITAS
 
 ```bash
 cd backend

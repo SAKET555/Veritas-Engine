@@ -5,6 +5,7 @@ Run:  uvicorn main:app --reload --port 8000   (from the backend/ directory)
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -38,11 +39,13 @@ from models import (
 from pruning import SubgraphPruner
 from reconciliation import AuditLedger, ReconciliationEngine
 from scenarios import trajectory
+import ab_service
 
 logger = logging.getLogger("veritas")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 AUDIT_LOG_PATH = Path(os.getenv("AUDIT_LOG_PATH", Path(__file__).parent / "data" / "audit_log.jsonl"))
+REPORTS_DIR = Path(os.getenv("REPORTS_DIR", Path(__file__).parent / "reports"))
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if o.strip()]
 
 
@@ -55,6 +58,11 @@ class AppState:
         self.reconciler = ReconciliationEngine(self.graph, self.ledger)
         self.pruner = SubgraphPruner(self.graph, self.ledger)
         self.agent = VerifiableAgent(self.pruner, self.ledger, build_llm_client_from_env())
+        # Raw observation journal (what was *said*, in arrival order). The ledger records what the
+        # system *concluded*; the A/B Lab needs the raw stream to build the append-only baselines.
+        self.journal_path = ledger_path.with_name("observations.jsonl")
+        self.journal: list[dict] = []
+        self.ab_jobs = ab_service.ABJobManager(REPORTS_DIR)
 
     def boot(self) -> ChainVerification:
         verification = self.ledger.load()
@@ -62,7 +70,23 @@ class AppState:
             raise RuntimeError(f"Audit ledger failed verification: {verification.detail}")
         applied = self.reconciler.replay()
         logger.info("Replayed %d ledger records from %s", applied, self.ledger.path)
+        if self.journal_path.exists():
+            with self.journal_path.open(encoding="utf-8") as fh:
+                self.journal = [json.loads(line) for line in fh if line.strip()]
         return verification
+
+    def record(self, text: str, timestamp: datetime, source: str, confidence: float) -> None:
+        entry = {"text": text, "timestamp": timestamp.isoformat(), "source": source, "confidence": confidence}
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.journal_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+        self.journal.append(entry)
+
+    def archive_journal(self) -> None:
+        if self.journal_path.exists() and self.journal_path.stat().st_size:
+            stamp = utc_now().strftime("%Y%m%dT%H%M%S%fZ")
+            self.journal_path.rename(self.journal_path.with_name(f"observations.{stamp}.archived.jsonl"))
+        self.journal = []
 
     def ingest(self, triples: list[TripleObservation]) -> list:
         return [self.reconciler.ingest(t) for t in triples]
@@ -127,6 +151,8 @@ def observe(req: ObservationRequest) -> ObservationResponse:
         outcomes = state.ingest(triples)
     except (ValueError, GraphEngineError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    journal_text = req.text if req.text and not req.subject else f"{req.subject} | {req.predicate} | {req.object}"
+    state.record(journal_text, ts, req.source, req.confidence)
     return ObservationResponse(provenance_id=provenance_id, extracted_triples=triples, outcomes=outcomes)
 
 
@@ -212,6 +238,7 @@ def reset() -> dict:
     with state.graph.lock:
         archived = state.ledger.archive_and_reset()
         state.graph.clear()
+        state.archive_journal()
     return {"archived_to": str(archived) if archived else None}
 
 
@@ -221,9 +248,71 @@ def seed_demo() -> dict:
     reset()
     decisions: dict[str, int] = {}
     for obs in trajectory():
+        state.record(obs.text, obs.timestamp, obs.source, obs.confidence)
         prov = new_uuid()
         for triple in extract_triples(obs.text, confidence=obs.confidence, source=obs.source,
                                       timestamp=obs.timestamp, provenance_id=prov):
             outcome = state.reconciler.ingest(triple)
             decisions[outcome.decision] = decisions.get(outcome.decision, 0) + 1
     return {"ledger_records": len(state.ledger), "decisions": decisions, "graph": state.graph.stats()}
+
+
+# --------------------------------------------------------------------------- #
+# A/B Lab
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/observations")
+def observations() -> dict:
+    """Raw observations made through this dashboard, in arrival order."""
+    return {"count": len(state.journal), "observations": state.journal}
+
+
+@app.get("/api/ab/models")
+def ab_models() -> dict:
+    return {**ab_service.list_models(os.getenv("OLLAMA_URL", "http://localhost:11434")), "default": "llama3.2"}
+
+
+@app.get("/api/ab/preset")
+def ab_preset() -> dict:
+    return ab_service.preset()
+
+
+@app.post("/api/ab/suggest-queries")
+def ab_suggest(req: ab_service.SuggestRequest) -> dict:
+    try:
+        return ab_service.suggest_queries(req.observations, req.max_questions)
+    except ab_service.ObservationError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc), "errors": exc.errors}) from exc
+
+
+@app.post("/api/ab/runs")
+def ab_start(req: ab_service.ABRunRequest) -> dict:
+    try:
+        job = state.ab_jobs.submit(req)
+    except ab_service.ObservationError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc), "errors": exc.errors}) from exc
+    except ab_service.BusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return job.view()
+
+
+@app.get("/api/ab/runs")
+def ab_list() -> dict:
+    return {"runs": state.ab_jobs.list()}
+
+
+@app.get("/api/ab/runs/{job_id}")
+def ab_get(job_id: str) -> dict:
+    job = state.ab_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown A/B run {job_id!r}")
+    return job.view()
+
+
+@app.post("/api/ab/runs/{job_id}/cancel")
+def ab_cancel(job_id: str) -> dict:
+    job = state.ab_jobs.cancel(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown A/B run {job_id!r}")
+    return job.view(include_rows=False)

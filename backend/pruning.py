@@ -350,8 +350,9 @@ class SubgraphPruner:
         day = lambda ts: ts.strftime("%Y-%m-%d")  # noqa: E731
         aliases: dict[str, str] = {}
         citations: dict[str, str] = {}
-        stamp = day(as_of) if as_of else "now"
-        lines = [f'Facts as of {stamp} ("past" = no longer true):']
+        # Keep the header neutral: an earlier header that defined "past" made a 3B model read
+        # *every* fact as no longer true and answer UNKNOWN (measured: 5/11 → 12/15 when fixed).
+        lines = [f"Facts (as of {day(as_of)}):" if as_of else "Facts:"]
         for n, edge in enumerate(ordered, start=1):
             record = self.ledger.latest_for_edge(edge.id)
             short = record.short_id if record else edge.id[:8]
@@ -362,8 +363,8 @@ class SubgraphPruner:
                 lines.append(f"{head} (since {day(edge.t_start)})")
                 continue
             successor = self._successor(edge)
-            replaced = f", replaced by {self._name(successor.target_id)}" if successor else ""
-            lines.append(f"{head} (past: {day(edge.t_start)} to {day(edge.t_end)}{replaced})")  # type: ignore[arg-type]
+            replaced = f"; replaced by {self._name(successor.target_id)}" if successor else ""
+            lines.append(f"{head} (ENDED {day(edge.t_end)}, was true from {day(edge.t_start)}{replaced})")  # type: ignore[arg-type]
         if not ordered:
             lines.append("(none)")
         return "\n".join(lines), aliases, citations

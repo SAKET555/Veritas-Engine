@@ -28,8 +28,12 @@ async function request(path, { method = "GET", body, params } = {}) {
     const detail = data?.detail;
     const message = Array.isArray(detail)
       ? detail.map((d) => `${(d.loc || []).join(".")}: ${d.msg}`).join("; ")
-      : detail || `${res.status} ${res.statusText}`;
-    throw new ApiError(res.status, message);
+      : detail && typeof detail === "object"
+        ? detail.message
+        : detail || `${res.status} ${res.statusText}`;
+    const error = new ApiError(res.status, message);
+    error.errors = detail && typeof detail === "object" && !Array.isArray(detail) ? detail.errors : undefined;
+    throw error;
   }
   return data;
 }
@@ -60,3 +64,16 @@ export function formatTs(iso, { withTime = true } = {}) {
   const time = d.toISOString().slice(11, 16);
   return time === "00:00" ? date : `${date} ${time}Z`;
 }
+
+// ---- A/B Lab ---------------------------------------------------------------
+export const labApi = {
+  models: () => request("/api/ab/models"),
+  preset: () => request("/api/ab/preset"),
+  dashboardObservations: () => request("/api/observations"),
+  suggest: (observations, maxQuestions = 12) =>
+    request("/api/ab/suggest-queries", { method: "POST", body: { observations, max_questions: maxQuestions } }),
+  start: (payload) => request("/api/ab/runs", { method: "POST", body: payload }),
+  get: (id) => request(`/api/ab/runs/${id}`),
+  list: () => request("/api/ab/runs"),
+  cancel: (id) => request(`/api/ab/runs/${id}/cancel`, { method: "POST" }),
+};

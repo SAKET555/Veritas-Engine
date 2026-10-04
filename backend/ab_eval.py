@@ -42,7 +42,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from agent import (
     SYSTEM_PROMPT,
@@ -464,7 +464,14 @@ class ABRunner:
             except LLMError as exc:  # a degenerate warm-up generation is irrelevant to the measurement
                 print(f"  warm-up call for {method.key} failed ({exc}); continuing")
 
-    def run(self) -> list[Row]:
+    def run(
+        self,
+        on_row: Optional[Callable[[Row, int, int], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        quiet: bool = False,
+    ) -> list[Row]:
+        """Execute every (repeat, query, method) call. ``on_row(row, done, total)`` streams progress;
+        ``should_stop()`` is polled between calls for cooperative cancellation."""
         rows: list[Row] = []
         total = self.repeats * len(self.queries) * len(self.methods)
         done = 0
@@ -504,13 +511,19 @@ class ABRunner:
                         system_prompt=bundle.system, user_prompt=bundle.user,
                     ))
                     done += 1
+                    if on_row is not None:
+                        on_row(rows[-1], done, total)
+                    if should_stop is not None and should_stop():
+                        return rows
+                    if quiet:
+                        continue
                     if self.verbose:
                         mark = "✓" if g.correct else "✗"
                         print(f"  [{done:3d}/{total}] {method.key:<2} {mark} {query.question[:48]:<48} "
                               f"→ {g.answer[:40]!r} ({wall_ms:,.0f} ms)")
                     else:
                         print(f"\r  running {done}/{total}", end="", flush=True)
-        if not self.verbose:
+        if not self.verbose and not quiet:
             print()
         return rows
 

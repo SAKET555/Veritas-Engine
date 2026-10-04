@@ -77,7 +77,7 @@ def test_mock_abstains_without_context(stack: Stack) -> None:
     )
     assert standard.answer.startswith("INSUFFICIENT_CONTEXT")
     assert standard.grounded  # abstention is grounded behaviour
-    compact = agent_with(stack, MockLLMClient()).answer(QueryRequest(question="Where does Zed live?"))
+    compact = agent_with(stack, MockLLMClient()).answer(QueryRequest(question="Where does Zed live?", prompt_style="compact"))
     assert compact.answer.startswith("ANSWER: UNKNOWN")
     assert compact.grounded
 
@@ -96,18 +96,19 @@ def test_compact_prompt_is_smaller_and_omits_rationale(world: Stack) -> None:
     agent = agent_with(world, client)
     agent.answer(QueryRequest(question="Where did Alice live before London?", prompt_style="standard"))
     standard = client.last_user_prompt
-    resp = agent.answer(QueryRequest(question="Where did Alice live before London?"))
+    resp = agent.answer(QueryRequest(question="Where did Alice live before London?", prompt_style="compact"))
     compact = client.last_user_prompt
     assert resp.prompt_style == "compact"
     assert len(compact) < len(standard) / 2
     assert "Mutation audit trail" not in compact and "M:" not in compact
     assert "[1] Alice -lives_in-> London (since" in compact
-    assert "Alice -lives_in-> Mumbai (past:" in compact and "replaced by London" in compact
+    assert "Alice -lives_in-> Mumbai (ENDED" in compact and "replaced by London" in compact
+    assert compact.startswith("Facts:\n")  # neutral header (see pruning.serialize_compact)
 
 
 def test_compact_tags_resolve_to_ledger_records(world: Stack) -> None:
     agent = agent_with(world, ScriptedClient("ANSWER: London\nEXPLANATION: see [1] and [1, 9]."))
-    resp = agent.answer(QueryRequest(question="Where does Alice live?"))
+    resp = agent.answer(QueryRequest(question="Where does Alice live?", prompt_style="compact"))
     good = next(c for c in resp.citations if c.alias == "1")
     assert good.verified and good.mutation_id and world.ledger.resolve_short_id(good.short_id)
     bogus = next(c for c in resp.citations if c.alias == "9")
