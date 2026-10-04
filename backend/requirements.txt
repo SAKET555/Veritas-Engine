@@ -1,0 +1,7 @@
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27
+pydantic>=2.6,<3.0
+networkx>=3.2
+httpx>=0.27
+# Optional: exact BPE token counts (falls back to a chars/4 estimator if absent)
+# tiktoken>=0.7
