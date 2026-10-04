@@ -266,3 +266,8 @@ The vector-RAG baseline uses a deterministic hashed dense encoder (no model down
 top-ranked retrieved chunk for the asked (subject, predicate). The default agent reader is the deterministic
 `MockLLMClient`, which reads only the prompt text. Absolute numbers will differ with a real embedding model or LLM;
 the structural failure, where a temporally blind index retrieves stale and fresh facts side by side, does not.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). Copyright 2026 Saket Hegde. See [NOTICE](NOTICE) for
+attribution.

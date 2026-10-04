@@ -1,0 +1,8 @@
+VERITAS — Verifiable Knowledge State Editing for Long-Horizon AI Agents
+Copyright 2026 Saket Hegde
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The bi-temporal agent-memory design is inspired by Graphiti / Zep
+(Rasmussen et al., 2025, arXiv:2501.13956, https://github.com/getzep/graphiti).
+VERITAS is an independent implementation and contains no Graphiti or Zep code.
