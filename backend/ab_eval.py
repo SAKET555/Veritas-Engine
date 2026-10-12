@@ -16,6 +16,16 @@ A2  vector retrieval     top-k observations by dense cosine similarity, no state
 B   VERITAS (standard)   the pruned, active, verified subgraph plus the full
                          rationale audit trail and 8-hex mutation-ID citations,
                          built by the real reconciliation engine and ledger
+A3  hybrid RAG           BM25 + dense retrieval fused by reciprocal rank fusion
+                         (the common production RAG stack), no invalidation
+A4  static graph RAG     the same extracted triples in a knowledge graph with no
+                         time dimension; k-hop ego graph around the question's
+                         entities (every value a slot ever had, none marked old)
+A5  overwrite memory     mutable slot memory without audit-trailed
+                         reconciliation: the last-arriving value overwrites,
+                         no history, no source authority, no ledger
+B3  VERITAS (optimized)  method B's prompt with the opt-in retrieval options:
+                         ego-local scoring, hub damping, dates read from the question
 B2  VERITAS (compact)    the same pruned subgraph in the token-lean format:
                          short instructions, [n] citation tags mapped to ledger
                          IDs server-side, "replaced by" links, no rationale text
@@ -55,7 +65,7 @@ from agent import (
     OpenAICompatibleClient,
     VerifiableAgent,
 )
-from benchmark import DenseVectorRAG, HashedDenseEncoder
+from baselines import DenseVectorRAG, HashedDenseEncoder, HybridRAG, OverwriteMemory, StaticGraphRAG
 from extraction import extract_triples
 from graph_engine import TemporalGraphEngine
 from models import PruningParams, QueryRequest, TripleObservation
@@ -109,6 +119,21 @@ You are an assistant agent. The notes below were retrieved from your long-term m
 to the question; each has the time it was recorded. The world changes over time, so notes may conflict;
 when they do, work out which value is true now. Answer only from the notes.
 If the notes do not contain the answer, reply ANSWER: UNKNOWN.
+
+{FORMAT_INSTRUCTIONS}"""
+
+GRAPH_SYSTEM = f"""Memory mode: knowledge graph.
+You are an assistant agent. The facts below were retrieved from your knowledge graph around the entities
+in the question, one "subject -relation-> object" per line. The world changes over time, so facts may
+conflict; when they do, work out which value is true now. Answer only from the facts.
+If the facts do not contain the answer, reply ANSWER: UNKNOWN.
+
+{FORMAT_INSTRUCTIONS}"""
+
+MEMORY_SYSTEM = f"""Memory mode: agent memory.
+You are an assistant agent. The entries below are the current values stored in your long-term memory
+for the entities in the question, each with the time it was last updated. Answer only from the memory.
+If the memory does not contain the answer, reply ANSWER: UNKNOWN.
 
 {FORMAT_INSTRUCTIONS}"""
 
@@ -178,6 +203,69 @@ class VectorRetrieval(MemoryMethod):
         return PromptBundle(RAG_SYSTEM, f"{context}\n\nQuestion: {question}", context, {"retrieved": len(hits)})
 
 
+class _SearchBaseline(MemoryMethod):
+    """Adapter from a :mod:`baselines` memory (``ingest`` + ``search``) to the A/B harness."""
+
+    system: str
+
+    def __init__(self, memory) -> None:  # type: ignore[no-untyped-def]
+        self.memory = memory
+
+    def observe(self, obs: ScriptedObservation, triples: list[TripleObservation]) -> None:
+        self.memory.ingest(obs, triples)
+
+    def build(self, question: str) -> PromptBundle:
+        found = self.memory.search(question)
+        return PromptBundle(self.system, f"{found.context}\n\nQuestion: {question}", found.context, dict(found.meta))
+
+
+class HybridRetrieval(_SearchBaseline):
+    key, label = "A3", "hybrid RAG (BM25 + dense)"
+    system = RAG_SYSTEM
+
+    def __init__(self, top_k: int = 6) -> None:
+        super().__init__(HybridRAG(HashedDenseEncoder(), top_k=top_k))
+
+    def observe(self, obs: ScriptedObservation, triples: list[TripleObservation]) -> None:
+        self.memory.ingest(obs, triples[:1])  # one chunk per observation, like A2
+
+
+class StaticGraph(_SearchBaseline):
+    key, label = "A4", "static graph RAG (no time)"
+    system = GRAPH_SYSTEM
+
+    def __init__(self) -> None:
+        super().__init__(StaticGraphRAG())
+
+
+class OverwriteAgentMemory(_SearchBaseline):
+    key, label = "A5", "overwrite memory (no audit)"
+    system = MEMORY_SYSTEM
+
+    def __init__(self) -> None:
+        super().__init__(OverwriteMemory())
+
+
+def build_methods(client: LLMClient, ledger_path: Path, top_k: int = 6) -> tuple[dict[str, MemoryMethod], "VeritasMemory"]:
+    """Every available method, keyed as on the command line. Returns (methods, the shared VERITAS base)."""
+    base = VeritasMemory(ledger_path, client)
+    methods: dict[str, MemoryMethod] = {
+        "A1": AppendOnlyHistory(),
+        "A2": VectorRetrieval(top_k),
+        "A3": HybridRetrieval(top_k),
+        "A4": StaticGraph(),
+        "A5": OverwriteAgentMemory(),
+        "B": base,
+        "B2": VeritasCompact(base),
+        "B3": VeritasOptimized(base),
+    }
+    return methods, base
+
+
+ALL_METHODS = ("A1", "A2", "A3", "A4", "A5", "B", "B2", "B3")
+DEFAULT_METHODS = ("A1", "A2", "B", "B2")
+
+
 class VeritasMemory(MemoryMethod):
     key, label = "B", "VERITAS (standard prompt)"
 
@@ -195,9 +283,12 @@ class VeritasMemory(MemoryMethod):
             self.decisions[outcome.decision] = self.decisions.get(outcome.decision, 0) + 1
 
     style = "standard"
+    pruning = PruningParams()
+    detect_as_of = False
 
     def build(self, question: str) -> PromptBundle:
-        plan = self.agent.plan(QueryRequest(question=question, pruning=PruningParams(), prompt_style=self.style))
+        plan = self.agent.plan(QueryRequest(question=question, pruning=self.pruning, prompt_style=self.style,
+                                            detect_as_of=self.detect_as_of))
         system = VERITAS_SYSTEM if self.style == "standard" else plan.system
         context = f"{plan.context}\n\n{plan.audit}" if plan.audit else plan.context
         return PromptBundle(
@@ -232,6 +323,16 @@ class VeritasCompact(VeritasMemory):
 
     def observe(self, obs: ScriptedObservation, triples: list[TripleObservation]) -> None:
         """No-op: method B already ingested this observation into the shared graph."""
+
+
+class VeritasOptimized(VeritasCompact):
+    """Method B's prompt over the same graph, with the opt-in retrieval options switched on:
+    ego-local candidate scoring, hub damping, and answering at a date named in the question."""
+
+    key, label = "B3", "VERITAS (optimized retrieval)"
+    style = "standard"
+    pruning = PruningParams(candidate_mode="ego", hub_damping=0.5)
+    detect_as_of = True
 
 
 # --------------------------------------------------------------------------- #
@@ -374,7 +475,7 @@ def summarize(rows: list[Row], methods: list[MemoryMethod]) -> dict:
             "context_saturated": sum(1 for r in mine if r.timings_ms.get("context_saturated")),
             "generation_errors": sum(1 for r in mine if r.timings_ms.get("generation_error")),
         }
-        if m.key in ("B", "B2"):
+        if m.key.startswith("B"):
             summary["citation_verified_rate"] = sum(bool(r.extra.get("citations_verified")) for r in mine) / len(mine)
         out[m.key] = summary
     return out
@@ -551,7 +652,7 @@ def print_side_by_side(rows: list[Row], methods: list[MemoryMethod], queries: Se
                 continue
             mark = "✓" if r.correct else ("✗ STALE" if r.stale_values else "✗")
             cite = ""
-            if m.key in ("B", "B2"):
+            if m.key.startswith("B"):
                 cite = " cites✓" if r.extra.get("citations_verified") else " cites✗"
             answer = r.answer if len(r.answer) <= 34 else r.answer[:31] + "..."
             print(f"  {m.key:<2} {m.label:<32} {mark:<8} {answer!r:<38}{cite:<8} "
@@ -577,7 +678,7 @@ def print_summary(summary: dict, methods: list[MemoryMethod]) -> None:
     row("stale / conflicting answer", [pct(summary[k]["stale_answer_rate"]) for k in keys])
     row("answer-format compliance", [pct(summary[k]["format_compliance"]) for k in keys])
     row("degenerate generations", [str(summary[k]["generation_errors"]) for k in keys])
-    if "B" in summary or "B2" in summary:
+    if any(k.startswith("B") for k in summary):
         row("verified citations", [pct(summary[k]["citation_verified_rate"]) if "citation_verified_rate" in summary[k]
                                    else "n/a" for k in keys])
     row("prompt tokens (mean)", [f"{summary[k]['prompt_tokens_mean']:,.0f} ({summary[k]['prompt_tokens_source'][:5]})" for k in keys])
@@ -588,11 +689,14 @@ def print_summary(summary: dict, methods: list[MemoryMethod]) -> None:
     row("generation mean (ms)", [f"{summary[k]['generation_ms_mean']:,.0f}" if summary[k]["generation_ms_mean"] is not None else "n/a" for k in keys])
     row("decode speed (tok/s)", [f"{summary[k]['tokens_per_s_mean']:.1f}" if summary[k]["tokens_per_s_mean"] else "n/a" for k in keys])
     print("-" * (34 + width * len(keys)))
-    for base, challenger in (("A1", "B"), ("A1", "B2"), ("B", "B2")):
+    for base, challenger in (("A1", "B"), ("A2", "B"), ("A3", "B"), ("A4", "B"), ("A5", "B"), ("A1", "B2"), ("B", "B2")):
         if base in summary and challenger in summary:
             a, b = summary[base], summary[challenger]
-            print(f"{challenger} vs {base}: {100 * (1 - b['prompt_tokens_mean'] / a['prompt_tokens_mean']):.1f}% fewer "
-                  f"prompt tokens, {a['latency_ms_median'] / b['latency_ms_median']:.2f}x median latency speed-up, "
+            saving = 1 - b["prompt_tokens_mean"] / a["prompt_tokens_mean"]
+            tokens = f"{100 * abs(saving):.1f}% {'fewer' if saving >= 0 else 'more'} prompt tokens"
+            speed = (f"{a['latency_ms_median'] / b['latency_ms_median']:.2f}x median latency speed-up"
+                     if a["latency_ms_median"] > 0 and b["latency_ms_median"] > 0 else "latency n/a")
+            print(f"{challenger} vs {base}: {tokens}, {speed}, "
                   f"accuracy {100 * a['accuracy']:.0f}% → {100 * b['accuracy']:.0f}%")
     saturated = {k: summary[k]["context_saturated"] for k in keys if summary[k]["context_saturated"]}
     if saturated:
@@ -666,10 +770,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--model", default="llama3.2", help="e.g. llama3.2, qwen2.5:3b, phi3.5")
     p.add_argument("--base-url", default=None)
     p.add_argument("--endpoint", choices=["chat", "generate"], default="chat", help="Ollama API endpoint")
-    p.add_argument("--methods", default="A1,A2,B,B2", help="comma-separated subset of A1,A2,B,B2")
+    p.add_argument("--methods", default=",".join(DEFAULT_METHODS), help=f"comma-separated subset of {','.join(ALL_METHODS)}")
     p.add_argument("--repeats", type=int, default=1, help="timed repetitions of the full query set")
     p.add_argument("--scale", type=int, default=1, help="multiply the background history (1 = demo trajectory)")
-    p.add_argument("--top-k", type=int, default=6, help="retrieval depth for A2")
+    p.add_argument("--dataset", choices=["demo", "synthetic"], default="demo",
+                   help="demo: the scripted trajectory and its 11 questions; synthetic: datasets.generate() with "
+                        "independent ground truth (rumors, late arrivals, point-in-time questions)")
+    p.add_argument("--people", type=int, default=20, help="synthetic dataset: people in the world")
+    p.add_argument("--sessions", type=int, default=5, help="synthetic dataset: sessions")
+    p.add_argument("--questions", type=int, default=18, help="synthetic dataset: questions")
+    p.add_argument("--seed", type=int, default=7, help="synthetic dataset: random seed")
+    p.add_argument("--top-k", type=int, default=6, help="retrieval depth for A2 and A3")
     p.add_argument("--num-ctx", type=int, default=0, help="Ollama context window; 0 = smallest that fits every prompt")
     p.add_argument("--num-gpu", type=int, default=None, help="layers to offload to GPU (0 = CPU only)")
     p.add_argument("--allow-prompt-cache", action="store_true",
@@ -686,41 +797,43 @@ def main(argv: Optional[list[str]] = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     client = build_client(args)
-    veritas_base = VeritasMemory(run_dir / "veritas_ledger.jsonl", client)
-    available: dict[str, MemoryMethod] = {
-        "A1": AppendOnlyHistory(),
-        "A2": VectorRetrieval(args.top_k),
-        "B": veritas_base,
-        "B2": VeritasCompact(veritas_base),
-    }
+    available, veritas_base = build_methods(client, run_dir / "veritas_ledger.jsonl", args.top_k)
     wanted = [k.strip().upper() for k in args.methods.split(",") if k.strip()]
     unknown = [k for k in wanted if k not in available]
     if unknown:
         p.error(f"unknown methods: {unknown}")
     methods = [available[k] for k in wanted]
-    if "B2" in wanted and "B" not in wanted:
-        # B2 reads the graph that B's ingestion builds; ingest through B without querying it.
+    if any(k in wanted for k in ("B2", "B3")) and "B" not in wanted:
+        # B2/B3 read the graph that B's ingestion builds; ingest through B without querying it.
         methods_for_ingest = [*methods, veritas_base]
     else:
         methods_for_ingest = methods
 
-    observations = scaled_trajectory(args.scale)
+    if args.dataset == "synthetic":
+        from datasets import generate
+
+        synthetic = generate(people=args.people, sessions=args.sessions, max_questions=args.questions, seed=args.seed)
+        observations = synthetic.observations
+        queries: Sequence[ABQuery] = [ABQuery(q.question, q.answer, q.wrong, q.category) for q in synthetic.questions]
+    else:
+        observations = scaled_trajectory(args.scale)
+        queries = AB_QUERIES
     print("=" * 108)
     print(f"VERITAS A/B evaluation · model={client.model_name} · methods={','.join(wanted)} · "
           f"repeats={args.repeats} · observations={len(observations)}")
     print("=" * 108)
-    runner = ABRunner(client, methods, AB_QUERIES, repeats=args.repeats, verbose=args.verbose,
+    runner = ABRunner(client, methods, queries, repeats=args.repeats, verbose=args.verbose,
                       bust_prompt_cache=not args.allow_prompt_cache, crash_retries=args.retries)
     runner.ingest(observations, methods_for_ingest)
     if isinstance(client, OllamaClient):
         if not args.num_ctx:
-            client.num_ctx = required_context(methods, AB_QUERIES, args.max_tokens)
+            client.num_ctx = required_context(methods, queries, args.max_tokens)
         print(f"  num_ctx={client.num_ctx} · num_gpu={'auto' if args.num_gpu is None else args.num_gpu} · "
               f"prompt cache {'allowed' if args.allow_prompt_cache else 'disabled (cold measurement)'}")
 
     veritas = veritas_base
     verification = veritas.ledger.verify()
-    if "B" in wanted or "B2" in wanted:
+    if any(k.startswith("B") for k in wanted):
         print(f"  VERITAS ledger: {verification.detail} · decisions {veritas.decisions}")
 
     try:
@@ -733,7 +846,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     summary = summarize(rows, methods)
-    print_side_by_side(rows, methods, AB_QUERIES)
+    print_side_by_side(rows, methods, queries)
     print_summary(summary, methods)
 
     config = {
@@ -747,6 +860,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "methods": wanted,
         "repeats": args.repeats,
         "scale": args.scale,
+        "dataset": args.dataset if args.dataset == "demo" else {"name": "synthetic", **synthetic.config},
         "observations": len(observations),
         "top_k": args.top_k,
         "tokenizer_estimate": tokenizer_name(),
@@ -758,7 +872,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     }
     report = {"config": config, "summary": summary, "rows": [asdict(r) for r in rows]}
     (run_dir / "report.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-    write_markdown(run_dir / "report.md", config, summary, rows, methods, AB_QUERIES)
+    write_markdown(run_dir / "report.md", config, summary, rows, methods, queries)
     print(f"Reports written to {run_dir}")
     return 0
 

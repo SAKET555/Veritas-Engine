@@ -1,4 +1,4 @@
-"""Comparative benchmark: Verifiable TKG vs. dense Vector RAG on a non-stationary trajectory.
+"""Comparative benchmark: Verifiable TKG vs. RAG and graph baselines on a non-stationary trajectory.
 
     python benchmark.py                     # human-readable report
     python benchmark.py --json report.json  # also write machine-readable results
@@ -13,6 +13,10 @@ Step 3 (T2)  the agent is challenged on the mutated facts and their provenance.
 
 Both systems ingest the *same* observation stream.
 
+* Hybrid RAG (BM25 + dense, reciprocal rank fusion), static Graph RAG (no
+  time dimension) and overwrite memory (last arrival wins, no audit trail)
+  ingest the same triples; see ``baselines.py``. Their reader is the same
+  top-ranked-fact rule as vector RAG's.
 * Vector RAG stores every observation as an append-only chunk, embeds it with a
   dense encoder and retrieves top-k by cosine similarity. Its reader takes the
   highest-ranked retrieved chunk that addresses the asked (subject, predicate).
@@ -32,9 +36,7 @@ verifiable              every claim carries a citation that resolves in the hash
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import math
 import re
 import sys
 import tempfile
@@ -43,6 +45,16 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from agent import MockLLMClient, VerifiableAgent, build_llm_client_from_env
+from baselines import (  # noqa: F401 - re-exported for existing importers
+    Chunk,
+    DenseVectorRAG,
+    HashedDenseEncoder,
+    HybridRAG,
+    OverwriteMemory,
+    Retrieval,
+    SentenceTransformerEncoder,
+    StaticGraphRAG,
+)
 from extraction import extract_triples
 from graph_engine import TemporalGraphEngine
 from models import PruningParams, QueryRequest, TripleObservation
@@ -51,86 +63,6 @@ from pruning import SubgraphPruner
 from reconciliation import AuditLedger, ReconciliationEngine
 from scenarios import QUERIES, BenchmarkQuery, ScriptedObservation, trajectory
 from tokens import count_tokens, tokenizer_name
-
-# --------------------------------------------------------------------------- #
-# Dense vector RAG baseline
-# --------------------------------------------------------------------------- #
-
-_TOK = re.compile(r"[a-z0-9]+")
-
-
-class HashedDenseEncoder:
-    """Deterministic dense encoder (signed feature hashing of word + char-trigram features).
-
-    Projects text into a fixed-width, L2-normalized dense vector. It captures
-    exactly the property that matters here — lexical/semantic similarity with no
-    notion of time — without requiring model downloads.
-    """
-
-    name = "hashed-dense-384"
-
-    def __init__(self, dim: int = 384) -> None:
-        self.dim = dim
-
-    def _features(self, text: str) -> list[str]:
-        words = _TOK.findall(text.lower())
-        feats = [f"w:{w}" for w in words]
-        for w in words:
-            padded = f"#{w}#"
-            feats.extend(f"c:{padded[i:i + 3]}" for i in range(len(padded) - 2))
-        return feats
-
-    def encode(self, text: str) -> list[float]:
-        vec = [0.0] * self.dim
-        for feat in self._features(text):
-            digest = hashlib.md5(feat.encode("utf-8")).digest()
-            idx = int.from_bytes(digest[:4], "little") % self.dim
-            sign = 1.0 if digest[4] & 1 else -1.0
-            vec[idx] += sign * (2.0 if feat.startswith("w:") else 1.0)
-        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-        return [v / norm for v in vec]
-
-
-class SentenceTransformerEncoder:
-    def __init__(self, model: str = "all-MiniLM-L6-v2") -> None:
-        from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
-
-        self._model = SentenceTransformer(model)
-        self.name = f"st/{model}"
-
-    def encode(self, text: str) -> list[float]:
-        return [float(x) for x in self._model.encode(text, normalize_embeddings=True)]
-
-
-@dataclass
-class Chunk:
-    doc_id: str
-    text: str
-    triple: TripleObservation
-    vector: list[float]
-
-
-class DenseVectorRAG:
-    def __init__(self, encoder, top_k: int = 6) -> None:  # type: ignore[no-untyped-def]
-        self.encoder = encoder
-        self.top_k = top_k
-        self.chunks: list[Chunk] = []
-
-    def ingest(self, obs: ScriptedObservation, triples: list[TripleObservation]) -> None:
-        for triple in triples:
-            text = f"[{obs.timestamp:%Y-%m-%d}] {obs.text}."
-            self.chunks.append(Chunk(f"doc{len(self.chunks):04d}", text, triple, self.encoder.encode(text)))
-
-    def retrieve(self, question: str) -> list[tuple[float, Chunk]]:
-        q = self.encoder.encode(question)
-        scored = [(sum(a * b for a, b in zip(q, c.vector)), c) for c in self.chunks]
-        scored.sort(key=lambda x: -x[0])
-        return scored[: self.top_k]
-
-    @staticmethod
-    def context(hits: list[tuple[float, Chunk]]) -> str:
-        return "\n".join(f"- ({c.doc_id}, sim={s:.3f}) {c.text}" for s, c in hits)
-
 
 # --------------------------------------------------------------------------- #
 # Evaluation
@@ -181,6 +113,30 @@ def evaluate_rag(rag: DenseVectorRAG, q: BenchmarkQuery) -> QueryResult:
     )
 
 
+def evaluate_baseline(memory, q: BenchmarkQuery) -> QueryResult:  # type: ignore[no-untyped-def]
+    """Score any :mod:`baselines` memory with the same top-ranked-fact reader used for vector RAG."""
+    retrieval: Retrieval = memory.search(q.question)
+    relevant = [f for f in retrieval.facts if f.subject.lower() == q.subject.lower() and f.predicate == q.predicate]
+    answer = relevant[0].object if relevant else "(no relevant fact retrieved)"
+    values = {f.object for f in relevant}
+    stale = sorted(v for v in values if v in q.stale or (v in q.expected_also and not q.historical))
+    groups: dict[tuple[str, str], set[str]] = {}
+    for f in retrieval.facts:
+        if f.presented_as_current and get_spec(f.predicate).functional:
+            groups.setdefault((f.subject.lower(), f.predicate), set()).add(f.object)
+    contradiction = any(len(v) > 1 for v in groups.values())
+    correct = answer.lower() == q.expected.lower()
+    if q.historical:
+        correct = correct and all(any(v.lower() == f.object.lower() for f in relevant) for v in q.expected_also)
+    return QueryResult(
+        question=q.question, expected=q.expected, answer=answer, correct=correct,
+        stale_in_context=stale, contradiction=contradiction,
+        consistent=correct and not stale and not contradiction,
+        verifiable=False, context_tokens=count_tokens(retrieval.context),
+        extra={"retrieved": retrieval.context.splitlines()[1:]},
+    )
+
+
 def evaluate_tkg(agent: VerifiableAgent, q: BenchmarkQuery) -> QueryResult:
     resp = agent.answer(QueryRequest(question=q.question, pruning=PruningParams()))
     current_lines = [ln for ln in resp.pruned_context.splitlines() if ln.startswith("- ") and "[INVALIDATED]" not in ln]
@@ -223,7 +179,7 @@ def _pct(n: int, d: int) -> str:
     return f"{(100.0 * n / d):5.1f}%" if d else "  n/a"
 
 
-def run(embedder: str, top_k: int, verbose: bool) -> dict:
+def run(embedder: str, top_k: int, verbose: bool, all_baselines: bool = False) -> dict:
     observations = trajectory()
     encoder: Callable = SentenceTransformerEncoder() if embedder == "st" else HashedDenseEncoder()  # type: ignore[assignment]
 
@@ -238,9 +194,15 @@ def run(embedder: str, top_k: int, verbose: bool) -> dict:
         client = MockLLMClient()
     agent = VerifiableAgent(pruner, ledger, client)
     rag = DenseVectorRAG(encoder, top_k=top_k)
+    extra_baselines = {
+        "hybrid_rag": HybridRAG(encoder, top_k=top_k),
+        "static_graph_rag": StaticGraphRAG(),
+        "overwrite_memory": OverwriteMemory(),
+    } if all_baselines else {}
 
     print("=" * 96)
-    print("VERITAS benchmark — Verifiable Temporal KG vs. Dense Vector RAG")
+    print("VERITAS benchmark — Verifiable Temporal KG vs. "
+          + ("vector, hybrid, static-graph and overwrite memories" if all_baselines else "Dense Vector RAG"))
     print(f"encoder={encoder.name}  reader={client.model_name}  tokenizer={tokenizer_name()}  rag_top_k={top_k}")
     print("=" * 96)
 
@@ -250,6 +212,8 @@ def run(embedder: str, top_k: int, verbose: bool) -> dict:
         for obs in batch:
             triples = extract_triples(obs.text, confidence=obs.confidence, source=obs.source, timestamp=obs.timestamp)
             rag.ingest(obs, triples)
+            for memory in extra_baselines.values():
+                memory.ingest(obs, triples)
             for triple in triples:
                 outcome = reconciler.ingest(triple)
                 decisions[outcome.decision] = decisions.get(outcome.decision, 0) + 1
@@ -263,6 +227,7 @@ def run(embedder: str, top_k: int, verbose: bool) -> dict:
     print("-" * 96)
 
     rag_results = [evaluate_rag(rag, q) for q in QUERIES]
+    extra_results = {key: [evaluate_baseline(m, q) for q in QUERIES] for key, m in extra_baselines.items()}
     tkg_results = [evaluate_tkg(agent, q) for q in QUERIES]
 
     for q, r, t in zip(QUERIES, rag_results, tkg_results):
@@ -294,12 +259,23 @@ def run(embedder: str, top_k: int, verbose: bool) -> dict:
         }
 
     rag_summary, tkg_summary = agg(rag_results), agg(tkg_results)
+    extra_summaries = {key: agg(results) for key, results in extra_results.items()}
     full_tokens = tkg_results[0].extra["full_graph_tokens"]
     mean_pruned = sum(r.extra["pruned_context_tokens"] for r in tkg_results) / n
 
-    print("=" * 96)
-    print(f"{'metric':<28}{'Dense Vector RAG':>22}{'Verifiable TKG':>22}")
-    print("-" * 72)
+    if all_baselines:
+        columns = [("Dense Vector RAG", rag_summary), ("Hybrid BM25+Dense", extra_summaries["hybrid_rag"]),
+                   ("Static Graph RAG", extra_summaries["static_graph_rag"]),
+                   ("Overwrite memory", extra_summaries["overwrite_memory"]), ("Verifiable TKG", tkg_summary)]
+        col = 19
+    else:
+        columns = [("Dense Vector RAG", rag_summary), ("Verifiable TKG", tkg_summary)]
+        col = 22
+    width = 28 + col * len(columns)
+    outer = width if all_baselines else 96
+    print("=" * outer)
+    print(f"{'metric':<28}" + "".join(f"{label:>{col}}" for label, _ in columns))
+    print("-" * (width if all_baselines else 72))
     for key, label in (
         ("accuracy", "accuracy"),
         ("epistemic_consistency", "epistemic consistency"),
@@ -307,22 +283,23 @@ def run(embedder: str, top_k: int, verbose: bool) -> dict:
         ("contradiction_rate", "contradictory context"),
         ("verifiable_rate", "verifiable (cited+chained)"),
     ):
-        print(f"{label:<28}{_pct(round(rag_summary[key] * n), n):>22}{_pct(round(tkg_summary[key] * n), n):>22}")
-    print(f"{'mean context tokens':<28}{rag_summary['mean_context_tokens']:>22.1f}{tkg_summary['mean_context_tokens']:>22.1f}")
-    print("-" * 72)
+        print(f"{label:<28}" + "".join(f"{_pct(round(summ[key] * n), n):>{col}}" for _, summ in columns))
+    print(f"{'mean context tokens':<28}" + "".join(f"{summ['mean_context_tokens']:>{col}.1f}" for _, summ in columns))
+    print("-" * (width if all_baselines else 72))
     print(f"TKG graph-context tokens: mean {mean_pruned:.1f} vs unpruned full graph {full_tokens} "
           f"→ {100.0 * (1 - mean_pruned / full_tokens):.1f}% reduction")
     print(f"Audit ledger integrity: {'VALID' if chain.valid else 'BROKEN'} — {chain.records_checked} records")
-    print("=" * 96)
+    print("=" * outer)
 
     return {
         "config": {"encoder": encoder.name, "reader": client.model_name, "tokenizer": tokenizer_name(), "rag_top_k": top_k},
         "decisions": decisions,
         "ledger": chain.model_dump(),
-        "summary": {"vector_rag": rag_summary, "tkg": tkg_summary,
+        "summary": {"vector_rag": rag_summary, **extra_summaries, "tkg": tkg_summary,
                     "full_graph_tokens": full_tokens, "mean_pruned_graph_tokens": mean_pruned},
         "per_query": {
             "vector_rag": [asdict(r) for r in rag_results],
+            **{key: [asdict(r) for r in results] for key, results in extra_results.items()},
             "tkg": [asdict(r) for r in tkg_results],
         },
     }
@@ -336,9 +313,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--top-k", type=int, default=6)
     parser.add_argument("--json", type=Path, default=None, help="write full results to this path")
     parser.add_argument("-v", "--verbose", action="store_true", help="print retrieved chunks and pruned contexts")
+    parser.add_argument("--all-baselines", action="store_true",
+                        help="also compare hybrid BM25+dense RAG, static graph RAG and overwrite memory")
     args = parser.parse_args(argv)
 
-    report = run(args.embedder, args.top_k, args.verbose)
+    report = run(args.embedder, args.top_k, args.verbose, args.all_baselines)
     if args.json:
         args.json.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         print(f"Wrote {args.json}")

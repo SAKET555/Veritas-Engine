@@ -106,7 +106,7 @@ class TemporalEdge(_UTCModel):
         return self.t_start <= ts and (self.t_end is None or ts < self.t_end)
 
 
-MutationType = Literal["INSERT", "INVALIDATE", "RECONCILE"]
+MutationType = Literal["INSERT", "INVALIDATE", "RECONCILE", "ALIAS"]
 
 
 class MutationAuditRecord(_UTCModel):
@@ -198,6 +198,13 @@ class ObservationRequest(_UTCModel):
         return self
 
 
+class AliasRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    alias: str = Field(min_length=1, max_length=200, description="Surface name, e.g. 'Bob'")
+    canonical: str = Field(min_length=1, max_length=200, description="Entity it refers to, e.g. 'Robert Smith'")
+
+
 class ObservationResponse(BaseModel):
     provenance_id: str
     extracted_triples: list[TripleObservation]
@@ -267,6 +274,15 @@ class PruningParams(BaseModel):
     recency_half_life_days: float = Field(default=30.0, gt=0.0)
     hop_decay: float = Field(default=0.6, gt=0.0, le=1.0)
     reverse_edge_penalty: float = Field(default=0.4, gt=0.0, le=1.0)
+    hub_damping: float = Field(
+        default=0.0, ge=0.0, le=2.0,
+        description="Reverse hops out of a non-seed node with fan-in d are divided by d**hub_damping (0 = off)",
+    )
+    candidate_mode: Literal["all", "ego"] = Field(
+        default="all",
+        description="all: score every fact (original behaviour); ego: score only facts that can reach τ from the "
+        "question's ego graph — same kept facts, O(ego) cost, unscored facts are only counted",
+    )
     include_history: Optional[bool] = Field(
         default=None, description="None = auto-detect historical intent from the question"
     )
@@ -283,6 +299,10 @@ class QueryRequest(_UTCModel):
     pruning: PruningParams = Field(default_factory=PruningParams)
     # Standard stays the default: on llama3.2-3B compact cut prompt tokens ~73% and latency ~3.5x
     # but lost accuracy (90.9% → 75.8% over 132 graded answers), so it is opt-in.
+    detect_as_of: bool = Field(
+        default=False,
+        description="When as_of is not given, answer at a calendar date named in the question ('on March 3, 2025')",
+    )
     prompt_style: PromptStyle = Field(
         default="standard",
         description="compact: short instructions + [n] citation tags (ledger-mapped server-side); "
@@ -313,6 +333,8 @@ class TokenMetrics(BaseModel):
     reduction_ratio: float
     full_graph_edges: int
     pruned_edges: int
+    edges_unscored: int = Field(default=0, description="Facts dropped without a score record: outside the ego "
+                                "graph or provably unable to reach τ")
     model_prompt_tokens: Optional[int] = Field(default=None, description="Prompt tokens under the model's tokenizer")
     model_completion_tokens: Optional[int] = None
 
@@ -336,6 +358,7 @@ class QueryResponse(BaseModel):
     citations: list[Citation]
     seed_entities: list[str]
     include_history: bool
+    as_of: Optional[datetime] = Field(default=None, description="Valid-time instant answered (given, or detected in the question)")
     pruned_context: str
     audit_context: str
     system_prompt: str

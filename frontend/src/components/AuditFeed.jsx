@@ -30,6 +30,16 @@ function AuditRecord({ record, highlighted, onSelectEntity }) {
         <span className="ml-auto font-mono text-[11px] text-slate-500">{formatTs(record.timestamp)}</span>
       </div>
 
+      {!edge && snap.alias && (
+        <div className="mt-2 text-sm">
+          <span className="font-medium text-fuchsia-300">{snap.alias.alias}</span>
+          <span className="mx-1.5 font-mono text-xs text-slate-400">≡ alias of ({snap.alias.mode})</span>
+          <button type="button" className="font-medium text-sky-300 hover:underline" onClick={() => onSelectEntity(snap.alias.canonical_id)}>
+            {snap.alias.canonical}
+          </button>
+        </div>
+      )}
+      {edge && (
       <div className="mt-2 text-sm">
         <button type="button" className="font-medium text-sky-300 hover:underline" onClick={() => onSelectEntity(edge.source_id)}>
           {snap.source_entity.name}
@@ -42,6 +52,7 @@ function AuditRecord({ record, highlighted, onSelectEntity }) {
           [{formatTs(edge.t_start)} → {edge.t_end ? formatTs(edge.t_end) : "∞"})
         </span>
       </div>
+      )}
 
       <p className="mt-1.5 text-xs leading-relaxed text-slate-400">{record.deterministic_rationale}</p>
 
@@ -67,7 +78,7 @@ function AuditRecord({ record, highlighted, onSelectEntity }) {
               {record.prior_state_snapshot ? JSON.stringify(record.prior_state_snapshot.edge, null, 1) : "∅ (new fact)"}
             </pre>
             <pre className="max-h-48 overflow-auto rounded bg-slate-950 p-2 text-[10px] text-emerald-200/80">
-              {JSON.stringify(edge, null, 1)}
+              {JSON.stringify(edge || snap.alias, null, 1)}
             </pre>
           </div>
         </div>
@@ -115,7 +126,7 @@ export default function AuditFeed({ records, verification, highlightedIds, onSel
       <div className="flex gap-2">
         <input className="input !py-1.5" placeholder="Filter: M:id, entity, text…" value={search} onChange={(e) => setSearch(e.target.value)} />
         <select className="input !w-auto !py-1.5" value={filter} onChange={(e) => setFilter(e.target.value)}>
-          {["ALL", "INSERT", "INVALIDATE", "RECONCILE"].map((t) => (
+          {["ALL", "INSERT", "INVALIDATE", "RECONCILE", "ALIAS"].map((t) => (
             <option key={t}>{t}</option>
           ))}
         </select>

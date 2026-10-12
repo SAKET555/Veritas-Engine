@@ -23,12 +23,12 @@ from pydantic import BaseModel, Field, field_validator
 from ab_eval import (
     AB_QUERIES,
     ABQuery,
+    ALL_METHODS,
+    DEFAULT_METHODS,
     ABRunner,
-    AppendOnlyHistory,
     MemoryMethod,
-    VectorRetrieval,
-    VeritasCompact,
     VeritasMemory,
+    build_methods,
     required_context,
     scaled_trajectory,
     summarize,
@@ -40,8 +40,8 @@ from models import ensure_utc
 from ontology import get_spec
 from scenarios import ScriptedObservation
 
-METHOD_KEYS = ("A1", "A2", "B", "B2")
-Category = Literal["changed", "stable", "multi-hop", "historical"]
+METHOD_KEYS = ALL_METHODS
+Category = Literal["changed", "stable", "multi-hop", "historical", "contested", "point-in-time"]
 _DEFAULT_START = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
 
 
@@ -72,7 +72,7 @@ class QueryIn(BaseModel):
 class ABRunRequest(BaseModel):
     observations: list[ObservationIn] = Field(min_length=1, max_length=3000)
     queries: list[QueryIn] = Field(min_length=1, max_length=60)
-    methods: list[str] = Field(default_factory=lambda: list(METHOD_KEYS))
+    methods: list[str] = Field(default_factory=lambda: list(DEFAULT_METHODS))
     provider: Literal["ollama", "llamacpp", "mock"] = "ollama"
     model: str = "llama3.2"
     base_url: Optional[str] = None
@@ -351,13 +351,7 @@ class ABJobManager:
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
             client = self._client(req)
-            base = VeritasMemory(run_dir / "veritas_ledger.jsonl", client)
-            available: dict[str, MemoryMethod] = {
-                "A1": AppendOnlyHistory(),
-                "A2": VectorRetrieval(req.top_k),
-                "B": base,
-                "B2": VeritasCompact(base),
-            }
+            available, base = build_methods(client, run_dir / "veritas_ledger.jsonl", req.top_k)
             methods = [available[k] for k in req.methods]
             ingest = methods if "B" in req.methods else [*methods, base]
             queries = to_queries(req.queries)

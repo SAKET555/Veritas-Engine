@@ -32,7 +32,7 @@ import httpx
 
 from models import Citation, QueryRequest, QueryResponse, TokenMetrics
 from ontology import predicate_tokens
-from pruning import SubgraphPruner, tokenize
+from pruning import SubgraphPruner, extract_as_of, tokenize
 from reconciliation import AuditLedger
 from tokens import count_tokens, tokenizer_name
 
@@ -549,7 +549,16 @@ class VerifiableAgent:
         self.ledger = ledger
         self.client = client
 
+    @staticmethod
+    def resolve_as_of(req: QueryRequest) -> QueryRequest:
+        """Fill ``as_of`` from a date named in the question ("on March 3, 2025") when none was given."""
+        if req.as_of is not None or not req.detect_as_of:
+            return req
+        detected = extract_as_of(req.question)
+        return req.model_copy(update={"as_of": detected}) if detected else req
+
     def plan(self, req: QueryRequest) -> PromptPlan:
+        req = self.resolve_as_of(req)
         if req.prompt_style == "standard":
             ctx, audit_text, audit_ids, user = self.build_prompt(req)
             return PromptPlan("standard", SYSTEM_PROMPT, user, ctx.text, audit_text,
@@ -563,6 +572,7 @@ class VerifiableAgent:
         return PromptPlan("compact", SYSTEM_PROMPT_COMPACT, user, text, "", set(citations), aliases, ctx)
 
     def build_prompt(self, req: QueryRequest):  # type: ignore[no-untyped-def]
+        req = self.resolve_as_of(req)
         seeds = self.pruner.resolve_seeds(req.question, req.seed_entities)
         ctx = self.pruner.prune(req.question, req.pruning, seeds=seeds, as_of=req.as_of)
         audit_text, audit_ids = self.pruner.serialize_audit_trail(
@@ -572,6 +582,7 @@ class VerifiableAgent:
         return ctx, audit_text, audit_ids, user
 
     def answer(self, req: QueryRequest) -> QueryResponse:
+        req = self.resolve_as_of(req)
         plan = self.plan(req)
         ctx, audit_text, user_prompt = plan.ctx, plan.audit, plan.user
 
@@ -597,6 +608,7 @@ class VerifiableAgent:
             reduction_ratio=round(1.0 - pruned_tokens / full_tokens, 4) if full_tokens else 0.0,
             full_graph_edges=len(self.pruner.graph.all_edges()),
             pruned_edges=len(ctx.kept_edges),
+            edges_unscored=ctx.unscored,
             model_prompt_tokens=completion.prompt_tokens,
             model_completion_tokens=completion.completion_tokens,
         )
@@ -610,6 +622,7 @@ class VerifiableAgent:
             citations=citations,
             seed_entities=ctx.seeds,
             include_history=ctx.include_history,
+            as_of=req.as_of,
             pruned_context=plan.context,
             audit_context=audit_text,
             system_prompt=plan.system,

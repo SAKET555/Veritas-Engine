@@ -10,6 +10,33 @@ export class ApiError extends Error {
   }
 }
 
+// Optional workspace (multi-tenant / authenticated deployments). Kept in this browser only.
+const WORKSPACE_KEY = "veritas.workspace";
+
+export function getWorkspace() {
+  try {
+    return JSON.parse(window.localStorage.getItem(WORKSPACE_KEY) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+export function setWorkspace(workspace) {
+  try {
+    window.localStorage.setItem(WORKSPACE_KEY, JSON.stringify(workspace || {}));
+  } catch {
+    // storage unavailable (private mode): the setting lasts until reload
+  }
+}
+
+function workspaceHeaders() {
+  const { tenant, apiKey } = getWorkspace();
+  const headers = {};
+  if (tenant) headers["X-Tenant-ID"] = tenant;
+  if (apiKey) headers["X-API-Key"] = apiKey;
+  return headers;
+}
+
 async function request(path, { method = "GET", body, params } = {}) {
   const url = new URL(`${API_BASE}${path}`, window.location.origin);
   if (params) {
@@ -19,7 +46,7 @@ async function request(path, { method = "GET", body, params } = {}) {
   }
   const res = await fetch(url, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers: { ...(body ? { "Content-Type": "application/json" } : {}), ...workspaceHeaders() },
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -52,6 +79,8 @@ export const api = {
   query: (payload) => request("/api/query", { method: "POST", body: payload }),
   reset: () => request("/api/reset", { method: "POST" }),
   seedDemo: () => request("/api/demo/seed", { method: "POST" }),
+  aliases: () => request("/api/entities/aliases"),
+  declareAlias: (alias, canonical) => request("/api/entities/alias", { method: "POST", body: { alias, canonical } }),
 };
 
 export const shortId = (uuid) => (uuid || "").replace(/-/g, "").slice(0, 8);

@@ -47,8 +47,14 @@ The bi-temporal model itself comes from temporal-database research (Snodgrass, 1
 | `backend/pruning.py` | Ego expansion, composite scoring, τ filtering, compact Markdown/JSON serialization |
 | `backend/agent.py` | Frozen-LLM harness: mock reader, OpenAI / Ollama / LiteLLM clients, citation verification |
 | `backend/main.py` | FastAPI app |
-| `backend/benchmark.py` | TKG vs dense vector RAG on a T0 → T1 → T2 trajectory |
+| `backend/benchmark.py` | TKG vs dense vector RAG on a T0 → T1 → T2 trajectory (`--all-baselines` adds three more) |
 | `backend/scenarios.py` | The shared demo/benchmark trajectory |
+| `backend/baselines.py` | Comparison memories: vector RAG, hybrid BM25 + dense RAG, static graph RAG, overwrite memory, full history |
+| `backend/datasets.py` | Synthetic multi-session benchmark with independent ground truth (rumors, late arrivals, dated questions) |
+| `backend/temporal_bench.py` | Offline benchmark of VERITAS vs every baseline, plus a latency/token scaling mode |
+| `backend/entity_linking.py` | Auditable entity linking (declared aliases, optional automatic normalization) |
+| `backend/observability.py` | Prometheus metrics without extra dependencies |
+| `docker-compose.yml`, `*/Dockerfile` | Container deployment (API, dashboard behind nginx, optional Ollama) |
 | `frontend/` | React 18 + Vite + Tailwind (JavaScript/JSX) dashboard |
 
 ## Setup
@@ -76,6 +82,10 @@ Environment variables:
 | `OPENAI_API_KEY` / `LITELLM_API_KEY` | — | credentials |
 | `AUDIT_LOG_PATH` | `backend/data/audit_log.jsonl` | ledger location |
 | `CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | allowed browser origins |
+| `VERITAS_API_KEYS` | unset (no auth) | `key1,key2:acme`: require `X-API-Key`; a `key:tenant` key is bound to that tenant |
+| `MAX_TENANTS` | `100` | tenants one process will load |
+| `ENTITY_LINKING` | `explicit` | `explicit` (declared aliases only) or `auto` (also link "Acme Inc." to an existing "Acme") |
+| `LEDGER_FSYNC` | `1` | `0` skips the per-transaction fsync (faster ingest, weaker crash durability) |
 
 For exact BPE token counts, run `pip install tiktoken`. Without it, a deterministic estimator is used.
 
@@ -96,13 +106,15 @@ origin, set `VITE_API_BASE=https://api.example.com` at build time.
 ```bash
 cd backend
 pip install -r requirements-dev.txt
-python -m pytest            # about 90 tests, runs in a few seconds, no network or API keys needed
+python -m pytest            # 176 tests, runs in about 15 seconds, no network or API keys needed
 ```
 
 The suite covers the graph engine (interval algebra, bi-temporal visibility), every reconciliation rule, ledger
 tamper and deletion detection, rollback on a failed ledger write, replay equivalence, extraction rules, pruning
 behaviour, citation verification (fabricated and out-of-context IDs), every API endpoint including restart
-persistence, and the end-to-end benchmark.
+persistence, and the end-to-end benchmark. It also covers the comparison baselines, the synthetic dataset and its
+reader, entity linking (including rollback and replay), tenants, API keys, metrics, and the opt-in retrieval options.
+One test checks that ego-local scoring keeps exactly the same facts as full scoring.
 
 ### Benchmark
 
@@ -112,6 +124,7 @@ python benchmark.py            # summary table
 python benchmark.py -v         # plus retrieved chunks and pruned contexts
 python benchmark.py --json out.json
 python benchmark.py --embedder st   # sentence-transformers encoder, if installed
+python benchmark.py --all-baselines # also hybrid BM25+dense RAG, static graph RAG, overwrite memory
 ```
 
 The exit code is 0 only when the TKG reaches 100% epistemic consistency and the ledger chain verifies.
@@ -233,6 +246,13 @@ Reports are written to `backend/reports/ab_<model>_<timestamp>/`:
 | `GET` | `/api/provenance/{entity_id}` | an entity's mutation trail with narratives |
 | `POST` | `/api/query` | prune → LLM → cited answer, pruned context, token metrics, per-edge scores |
 | `POST` | `/api/demo/seed`, `/api/reset` | load the demo trajectory / archive the ledger and start empty |
+| `POST` | `/api/entities/alias` | `{alias, canonical}` → an `ALIAS` ledger record; later observations naming the alias resolve to the entity |
+| `GET` | `/api/entities/aliases` | the alias table and linking mode |
+| `GET` | `/api/metrics` | Prometheus metrics (requests, latency, reconciliation decisions, tokens, citations, per-tenant state) |
+| `GET` | `/api/ready` | readiness probe: ledger loaded and hash chain verified |
+| `GET` | `/api/tenants` | tenants loaded in this process |
+
+Every endpoint accepts an optional `X-Tenant-ID` header (see [Cloud deployment](#cloud-deployment)).
 
 ## Reconciliation rules
 
@@ -266,6 +286,153 @@ The vector-RAG baseline uses a deterministic hashed dense encoder (no model down
 top-ranked retrieved chunk for the asked (subject, predicate). The default agent reader is the deterministic
 `MockLLMClient`, which reads only the prompt text. Absolute numbers will differ with a real embedding model or LLM;
 the structural failure, where a temporally blind index retrieves stale and fresh facts side by side, does not.
+
+## Optional retrieval settings
+
+All off by default, so existing behaviour and results are unchanged.
+
+| Setting | Where | Effect |
+|---|---|---|
+| `pruning.candidate_mode = "ego"` | `QueryRequest` | Score only facts that can still reach τ from the question's ego graph. The kept facts are identical to the default `"all"` (a test checks this); facts that cannot qualify are counted in `metrics.edges_unscored` instead of being scored one by one. Query cost then depends on the neighbourhood, not on the size of the whole history. |
+| `pruning.hub_damping = 0.5` | `QueryRequest` | Walking backwards out of a crowded non-seed node (a city thousands of people live in) is divided by `fan_in ** hub_damping`, so hub neighbours stop crowding the prompt. A hub the question is *about* is never damped. |
+| `detect_as_of = true` | `QueryRequest` | A date in the question ("on March 3, 2025", "2026-03-01", "15 March 2026") becomes `as_of`, so the answer is read from the graph as it was on that date. |
+| `--all-baselines` | `benchmark.py` | Adds the three extra baselines to the structural benchmark. |
+| `A3`, `A4`, `A5`, `B3` | A/B Lab and `ab_eval.py --methods` | Extra methods (see below). The default selection is still A1, A2, B, B2. |
+
+## Additional comparison baselines
+
+`baselines.py` adds the baselines the evaluation design calls for. Every one ingests the same extracted triples in the
+same order:
+
+| Key | Method | What it stands for |
+|---|---|---|
+| A3 | Hybrid BM25 + dense RAG | Okapi BM25 and dense retrieval fused by reciprocal rank fusion, the usual production RAG stack. No invalidation. |
+| A4 | Static graph RAG | The same triples in a knowledge graph with no time dimension; k-hop ego graph around the question's entities. Every value a fact ever had is present and none is marked old. |
+| A5 | Overwrite memory | Mutable slot memory without audit-trailed reconciliation: the last-arriving value overwrites, no history, no source authority, no ledger. |
+| B3 | VERITAS (optimized) | Method B's prompt over the same graph, with ego-local scoring, hub damping and date detection switched on. |
+
+## Temporal benchmark with independent ground truth
+
+```bash
+cd backend
+python temporal_bench.py                              # 40 people, 6 sessions, 60 questions
+python temporal_bench.py --people 120 --sessions 8    # a bigger world
+python temporal_bench.py --scaling 100,400,1000       # latency and tokens as the graph grows
+python temporal_bench.py --json r.json --markdown r.md --export-dataset ds.json
+python ab_eval.py --dataset synthetic --model llama3.2 --methods A1,A2,A3,A4,A5,B,B3   # same data, real SLM
+```
+
+`datasets.py` simulates a world that drifts across sessions and records the true validity interval of every value.
+The agent receives accurate updates plus **rumors** (low-authority claims of false values that never become true) and
+**late arrivals** (records about the period before anything else on file, delivered sessions later). Questions cover
+six categories: changed, contested (a rumor contradicted the fact), stable, point-in-time, historical and multi-hop.
+Ground truth comes from the simulation, not from VERITAS's rules, which removes the circularity of the A/B Lab's
+auto-generated questions.
+
+Every method's retrieval is read by the same deterministic reader, and that reader is generous to the baselines. It
+always takes the newest fact it was given, so a baseline loses only when its *memory* hands over stale, rumored or
+missing facts. No LLM is involved.
+
+Default run (40 people, 8 organizations, 6 sessions, 597 observations including 135 rumors, 60 questions, seed 7):
+
+| | Full history | Vector RAG | Hybrid BM25+dense | Static graph RAG | Overwrite memory | VERITAS | VERITAS optimized |
+|---|---|---|---|---|---|---|---|
+| Accuracy | 81.7% | 53.3% | 60.0% | 56.7% | 53.3% | **100%** | **100%** |
+| · changed | 100% | 72.7% | 81.8% | 100% | 100% | 100% | 100% |
+| · contested (rumor) | 40.0% | 20.0% | 30.0% | 40.0% | 40.0% | **100%** | **100%** |
+| · stable | 100% | 88.9% | 88.9% | 100% | 100% | 100% | 100% |
+| · point-in-time | 90.0% | 80.0% | 90.0% | 10.0% | 10.0% | **100%** | **100%** |
+| · historical | 90.0% | 60.0% | 70.0% | 80.0% | 0.0% | **100%** | **100%** |
+| · multi-hop | 70.0% | 0.0% | 0.0% | 10.0% | 70.0% | **100%** | **100%** |
+| Stale / wrong value answered | 13.3% | 23.3% | 16.7% | 28.3% | 11.7% | **0%** | **0%** |
+| Contradictory context | 100% | 80.0% | 75.0% | 100% | 0% | **0%** | **0%** |
+| Verifiable (ledger-cited) | 0% | 0% | 0% | 0% | 0% | **100%** | **100%** |
+| Context tokens (mean) | 12,623 | 131 | 135 | 541 | 479 | 552 | 538 |
+| Query latency mean | 0.06 ms | 28.2 ms | 28.6 ms | 1.9 ms | 1.6 ms | 13.3 ms | 2.8 ms |
+| Ingest per observation | 0.04 ms | 0.23 ms | 0.22 ms | 0.02 ms | 0.01 ms | 3.8 ms (fsync) | shared |
+
+Each baseline fails in its own characteristic way:
+
+- **Full history** contains every answer but also every contradiction; it costs 23 times VERITAS's tokens and is
+  still fooled by rumors.
+- **Vector and hybrid RAG** miss the second hop of multi-hop questions.
+- **Static graph RAG** and **overwrite memory** cannot answer dated questions.
+- **Overwrite memory** keeps no history.
+- **Every baseline** believes newer rumors.
+
+**Real model on the demo questions** (llama3.2 3B, CPU, `python ab_eval.py --methods A1,A2,A3,A4,A5,B,B2,B3`, one
+repeat):
+
+| | A1 full history | A2 vector RAG | A3 hybrid RAG | A4 static graph RAG | A5 overwrite memory | B VERITAS | B2 compact | B3 optimized |
+|---|---|---|---|---|---|---|---|---|
+| Accuracy (11 questions) | 81.8% | 54.5% | 63.6% | 54.5% | 72.7% | **90.9%** | 81.8% | **90.9%** |
+| · changed (5) | 60% | 40% | 40% | 40% | 100% | 100% | 80% | 100% |
+| · historical (3) | 100% | 66.7% | 100% | 66.7% | 0% | 66.7% | 66.7% | 66.7% |
+| · multi-hop (1) | 100% | 0% | 0% | 0% | 100% | 100% | 100% | 100% |
+| Stale / conflicting answers | 18.2% | 18.2% | 18.2% | 36.4% | 0% | 9.1% | 9.1% | 9.1% |
+| Verified citations | n/a | n/a | n/a | n/a | n/a | 100% | 90.9% | 100% |
+| Prompt tokens (model) | 1,757 | 258 | 261 | 438 | 385 | 561 | **149** | 561 |
+| Median latency | 21.4 s | 4.6 s | 4.6 s | 6.0 s | 5.0 s | 8.3 s | **2.3 s** | 8.2 s |
+
+**Scaling** (`python temporal_bench.py --scaling 100,400,1000 --questions 30`, ledger fsync on):
+
+| People | Observations | Facts | Ledger records | Ingest mean / p95 | Chain verify | Query default (mean / p95) | Query optimized (mean / p95) | Context tokens default / optimized | Full-history tokens |
+|---|---|---|---|---|---|---|---|---|---|
+| 100 | 1,533 | 1,214 | 2,294 | 2.8 / 4.6 ms | 190 ms | 34.7 / 46.9 ms | 4.3 / 15.1 ms | 643 / 617 | 32,319 |
+| 400 | 5,959 | 4,755 | 8,918 | 3.4 / 5.2 ms | 779 ms | 196.8 / 379.8 ms | 14.7 / 73.5 ms | 934 / 756 | 128,759 |
+| 1,000 | 14,787 | 11,758 | 22,142 | 3.4 / 5.2 ms | 1,886 ms | 527.6 / 1,000.4 ms | 56.7 / 230.9 ms | 1,187 / 811 | 337,986 |
+
+Every size kept 100% accuracy and a valid hash chain. Reconciliation cost per observation stays flat (about 3 ms,
+mostly the fsync), while full-history context grows linearly to 338k tokens. With the default settings, query time
+grows with the history, because every fact is scored. The optional ego-local mode keeps exactly the same facts and is
+9x faster at 11,758 facts, and hub damping holds context growth to 811 tokens instead of 1,187. Numbers are from one
+Windows laptop, CPU only; absolute values will vary, but the trends do not.
+
+## Entity linking
+
+Proposal phase 1 is "ingestion and entity linking". Entity ids are already slugs of the name, so case and punctuation
+variants merge. On top of that:
+
+- **Declared aliases** (always available): `POST /api/entities/alias {"alias": "Bob", "canonical": "Robert Smith"}`.
+  Later observations naming *Bob* are recorded against *Robert Smith*, and questions naming *Bob* seed *Robert Smith*.
+- **Automatic linking** (`ENTITY_LINKING=auto`): honorifics and legal-form suffixes are stripped ("Dr.", "Prof.",
+  "Inc.", "Ltd", "GmbH", …). The name is linked only when exactly one *existing* entity has the same normalized form;
+  ambiguous names are left alone.
+
+Every link is an `ALIAS` record in the hash-chained ledger with a deterministic rationale, so merges are as auditable
+as fact changes. Links are restored by replay and rolled back with their transaction. Past facts are never rewritten:
+a link applies from the moment it is recorded.
+
+## Cloud deployment
+
+```bash
+docker compose up --build                  # API on :8000, dashboard on :8080 (mock reader)
+docker compose --profile llm up --build    # plus Ollama; then: docker compose exec ollama ollama pull llama3.2
+```
+
+- **Tenants.** An `X-Tenant-ID` header gives each tenant its own graph, ledger and journal under
+  `data/tenants/<id>/`. With no header the `default` tenant is used, whose ledger is `AUDIT_LOG_PATH`: single-tenant
+  mode is unchanged. The dashboard has a tenant/API-key control in the header.
+- **API keys.** Set `VERITAS_API_KEYS`. `/api/health` and `/api/ready` stay public for orchestrator probes.
+- **Metrics.** `GET /api/metrics` serves the Prometheus text format, scrapable by Prometheus, Grafana Agent, the
+  OpenTelemetry Collector or managed cloud scrapers. It covers request count and latency by route, reconciliation
+  decisions, context tokens sent vs avoided, LLM latency, citation verification, and per-tenant ledger and graph size.
+- **Scaling model.** State is in memory and rebuilt from the ledger on boot, so run **one process per data volume**
+  (the image uses `--workers 1`). Scale out by sharding tenants across replicas, each with its own volume, never by
+  pointing two processes at one ledger file.
+
+## How the code maps to the book chapter
+
+| Chapter section | Code |
+|---|---|
+| 1. Agentic memory and the non-stationary state problem | `scenarios.py`, `datasets.py` (drift, rumors, late arrivals) |
+| 2. Foundations: cloud RAG, dense retrieval, knowledge graphs | `baselines.py` (vector, hybrid BM25 + dense, static graph) |
+| 3. Limits of vector and graph memory (bloat, stale retrieval, latency) | `temporal_bench.py` (stale answers, contradictions, tokens, `--scaling`) |
+| 4. Non-parametric persistence over a frozen model | `graph_engine.py`, `models.py`, `agent.py` |
+| 5. Audit-trailed reconciliation and provenance | `reconciliation.py` (R1–R5, hash chain, replay), `entity_linking.py` |
+| 6. Confidence-driven pruning and token minimization | `pruning.py` (scoring, τ, ego-local mode, hub damping, compact prompt) |
+| 7. Benchmark evaluation vs baseline RAG | `benchmark.py`, `temporal_bench.py`, `ab_eval.py`, A/B Lab |
+| 8. Practical cloud-native implementation | `main.py` (tenants, keys, metrics), `observability.py`, Docker / compose |
 
 ## License
 

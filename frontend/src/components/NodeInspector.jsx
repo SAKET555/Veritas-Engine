@@ -80,6 +80,13 @@ export default function NodeInspector({ entityId, refreshKey, onClose, onSelectE
                   <span className="chip bg-slate-800 text-slate-400">M:{record.mutation_id.replace(/-/g, "").slice(0, 8)}</span>
                   <span className="font-mono text-[10px] text-slate-500">#{record.sequence}</span>
                 </div>
+                {snap.alias ? (
+                  <div className="mt-1 text-xs text-slate-300">
+                    <span className="text-fuchsia-300">{snap.alias.alias}</span>{" "}
+                    <span className="font-mono text-slate-500">≡ alias of</span>{" "}
+                    {entityLink({ id: snap.alias.canonical_id, name: snap.alias.canonical })}
+                  </div>
+                ) : (
                 <div className="mt-1 text-xs text-slate-300">
                   {entityLink(snap.source_entity)} <span className="font-mono text-slate-500">—{snap.edge.relation}→</span>{" "}
                   {entityLink(snap.target_entity)}
@@ -87,6 +94,7 @@ export default function NodeInspector({ entityId, refreshKey, onClose, onSelectE
                     [{formatTs(snap.edge.t_start)} → {snap.edge.t_end ? formatTs(snap.edge.t_end) : "∞"})
                   </span>
                 </div>
+                )}
                 <p className="mt-1 text-[11px] leading-relaxed text-slate-500">{record.deterministic_rationale}</p>
               </li>
             );

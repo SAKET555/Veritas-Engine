@@ -115,9 +115,14 @@ and reversible.
 | `backend/ab_eval.py` | Head-to-head harness against a real local SLM. |
 | `backend/ab_service.py` | Background A/B jobs and question generation for the dashboard. |
 | `backend/scenarios.py` | The shared deterministic T0 → T1 → T2 trajectory. |
+| `backend/baselines.py` | Comparison memories: vector, hybrid BM25 + dense, static graph RAG, overwrite memory, full history. |
+| `backend/datasets.py` | Synthetic multi-session dataset with independent ground truth (§11.6). |
+| `backend/temporal_bench.py` | Offline benchmark of every memory with one shared reader, plus scaling mode (§11.6, §11.7). |
+| `backend/entity_linking.py` | Declared and automatic aliases, recorded as `ALIAS` ledger mutations (§7.1). |
+| `backend/observability.py` | Prometheus metrics (§10.1). |
 | `frontend/src/` | Dashboard (graph view and A/B Lab). |
 
-The codebase has roughly 4,800 lines of Python, 1,300 lines of tests and 2,300 lines of JSX/JS.
+The codebase has roughly 7,100 lines of Python, 1,900 lines of tests and 2,500 lines of JSX/JS.
 
 ---
 
@@ -264,6 +269,20 @@ job title of "Working", until the employment rule was moved ahead of the role ru
 be entered explicitly as `Subject | predicate | Object`. Determinism is deliberate: the same text must always produce
 the same triples, otherwise the ledger would not be reproducible.
 
+### 7.1 Entity linking
+
+Before reconciliation, subject and object pass through `EntityLinker`:
+
+1. A **declared alias** (`POST /api/entities/alias`) maps a surface name to a canonical entity. Aliases never chain:
+   aliasing to an alias points at its canonical entity, and cycles are rejected.
+2. In **auto mode** (`ENTITY_LINKING=auto`), a name that is not yet an entity is normalized by stripping honorifics
+   and legal-form suffixes. If exactly one existing entity has the same normalized form, the name is linked to it.
+   Zero or several matches mean no link.
+
+A new link is written as an `ALIAS` mutation in the *same transaction* as the fact that triggered it. If the ledger
+write fails, the link is undone with everything else. Replay rebuilds the alias table from those records, and the
+pruner resolves aliases when finding seeds in a question.
+
 ---
 
 ## 8. Confidence-driven subgraph pruning
@@ -328,6 +347,26 @@ questions this cuts VERITAS prompts by about 73%. Its accuracy trade-off is disc
 
 On the demo graph (86 facts, 12 of them historical), the standard pruned context averages **120 tokens, against 3,515
 for the full graph, a 96.6% reduction**.
+
+### 8.1 Optional retrieval settings
+
+Three settings are off by default, so the behaviour above and every number measured with it are unchanged.
+
+- **Ego-local candidates** (`candidate_mode="ego"`). The default scores every fact in the history, so query cost grows
+  with the whole graph. Since confidence and recency are at most 1, a fact cannot reach τ unless its structural
+  weight is at least `w_min = (τ·(α+β+γ) − α − β) / γ` (0.2 with the defaults). The ego walk therefore stops
+  expanding at nodes below `w_min`, and only facts touching a node at or above it are scored. The kept set is
+  provably identical, and a test checks it on a synthetic graph. Facts skipped this way are counted in
+  `edges_unscored`. The engine keeps insertion-order, relation and latest-time indexes so this path never scans the
+  history.
+- **Hub damping** (`hub_damping`). Walking backwards out of a non-seed node with fan-in `d > 1` is divided by
+  `d^hub_damping`. This applies to both the propagated node weights and the structural score of edges into that node.
+  At 0.5, a city shared by 900 people contributes 1/30 of its undamped weight to each of them. Seeds are never damped:
+  "Who lives in London?" still returns London's residents.
+- **Dates in questions** (`QueryRequest.detect_as_of`). ISO dates and "March 3, 2025" / "3 March 2025" forms become
+  `as_of`. A bare date means midday UTC; two different dates are treated as ambiguous and ignored.
+
+These three switches are method **B3** in the A/B harness and "VERITAS optimized" in the temporal benchmark.
 
 ---
 
@@ -402,6 +441,23 @@ The provider is chosen with `LLM_PROVIDER = mock | ollama | llamacpp | openai | 
 "current value" question, with every superseded value counted as a wrong answer, and a "what came before" question.
 Unchanged slots become stable controls. Ground truth therefore follows VERITAS's own rules, and the UI tells the user
 to review it.
+
+### 10.1 Cloud deployment
+
+The deployment features are all optional. With none configured, the server behaves exactly as a single local process.
+
+| Concern | Mechanism |
+|---|---|
+| Tenancy | `X-Tenant-ID` selects a tenant (1–63 of `a-z 0-9 - _`). Each tenant is booted lazily as its own graph, ledger and journal under `data/tenants/<id>/`, capped by `MAX_TENANTS`. The default tenant keeps the original ledger path. |
+| Authentication | `VERITAS_API_KEYS="k1,k2:acme"` requires `X-API-Key` or a bearer token. A key bound to a tenant cannot address another tenant or list tenants. Health and readiness probes stay public. |
+| Observability | `GET /api/metrics` in Prometheus text format, with no client library: HTTP request count and latency histogram by route template (bounded cardinality), reconciliation decisions, context tokens sent vs avoided, LLM latency, citation verification, and per-tenant ledger and graph size. |
+| Probes | `/api/health` (liveness) and `/api/ready` (ledger loaded and hash chain verified, else 503). |
+| Durability | `LEDGER_FSYNC=1` (default) fsyncs every transaction. Setting it to 0 trades crash durability for ingest throughput (§11.7). |
+| Packaging | `backend/Dockerfile` (non-root, one worker, health check), `frontend/Dockerfile` (nginx serving the build and proxying `/api`), `docker-compose.yml` (optional Ollama under the `llm` profile). |
+
+Because each tenant's state is an in-memory projection of its ledger, a tenant must be served by exactly one process.
+Scale out by routing tenants to replicas, each with its own volume, for example consistent hashing on `X-Tenant-ID` at
+the load balancer. The ledger stays the source of truth: a replica that restarts rebuilds its tenants by replay.
 
 ---
 
@@ -508,21 +564,116 @@ All results above are CPU results. On the CPU, prompt evaluation runs at about 8
 
 ### 11.5 Test suite
 
-There are 125 `pytest` tests in 10 files, and none needs network access or a model:
+There are 176 `pytest` tests in 16 files, and none needs network access or a model:
 
 - **Graph engine:** interval algebra and bi-temporal visibility.
 - **Reconciliation:** every rule, tamper and deletion detection, rollback on a failed write, replay equivalence and
   provenance.
 - **Extraction:** 18 sentence patterns.
 - **Pruning:** stale and hub-distractor removal, multi-hop retention, thresholds and both serializers.
+- **Pruning options:** date parsing, ego-local scoring that keeps exactly the same facts as full scoring, hub damping,
+  and checks that the defaults are unchanged.
 - **Agent:** grounding, fabricated and out-of-context citations, and compact tags.
 - **API:** every endpoint, including restart persistence and CORS.
+- **Cloud:** tenant isolation and limits, API keys (including tenant-bound keys), metrics, readiness, alias endpoints,
+  and opt-in date detection.
+- **Entity linking:** normalization, declared and automatic links, ambiguity, validation, replay, and rollback on a
+  failed ledger write.
+- **Baselines:** each one's characteristic behaviour and failure mode.
+- **Temporal benchmark:** generator determinism, independence of ground truth from rumors, the shared reader, and the
+  end-to-end comparison and CLI.
 - **SLM connectors:** fake HTTP servers via `httpx.MockTransport`.
-- **A/B harness:** grading, rotation, cache busting, crash retry and the CLI.
+- **A/B harness:** grading, rotation, cache busting, crash retry, the CLI, the new methods and the synthetic dataset.
 - **Lab service:** jobs, cancellation and question generation.
 - **Benchmark:** end to end.
 
----
+### 11.6 Temporal benchmark with independent ground truth
+
+`datasets.py` simulates people and organizations whose residence, employer, role, preference and headquarters drift
+across sessions, and keeps the *true* validity interval of every value. The observation stream adds:
+
+- **rumors:** `hearsay` claims of values that are never true, arriving after the truth;
+- **late arrivals:** `system_of_record` entries about the period *before* anything else on file, delivered sessions
+  later.
+
+Questions are sampled evenly from six categories (changed, contested, stable, point-in-time, historical, multi-hop).
+Their answers come from the simulation, so the evaluation of VERITAS is not circular.
+
+`temporal_bench.py` runs every memory over the same stream and reads every retrieval with **one deterministic
+reader**. The reader takes the newest fact for the slot, or the fact valid on the asked date, or the value before the
+current one, or two hops for multi-hop questions. This rule is the best a reader can do with timestamped facts, so it
+favours the baselines. Results for the default configuration:
+
+| | Full history | Vector RAG | Hybrid BM25+dense | Static graph RAG | Overwrite memory | VERITAS | VERITAS optimized |
+|---|---|---|---|---|---|---|---|
+| Accuracy | 81.7% | 53.3% | 60.0% | 56.7% | 53.3% | **100%** | **100%** |
+| · changed | 100% | 72.7% | 81.8% | 100% | 100% | 100% | 100% |
+| · contested (rumor) | 40.0% | 20.0% | 30.0% | 40.0% | 40.0% | **100%** | **100%** |
+| · stable | 100% | 88.9% | 88.9% | 100% | 100% | 100% | 100% |
+| · point-in-time | 90.0% | 80.0% | 90.0% | 10.0% | 10.0% | **100%** | **100%** |
+| · historical | 90.0% | 60.0% | 70.0% | 80.0% | 0.0% | **100%** | **100%** |
+| · multi-hop | 70.0% | 0.0% | 0.0% | 10.0% | 70.0% | **100%** | **100%** |
+| Stale / wrong value answered | 13.3% | 23.3% | 16.7% | 28.3% | 11.7% | **0%** | **0%** |
+| Contradictory context | 100% | 80.0% | 75.0% | 100% | 0% | **0%** | **0%** |
+| Verifiable (ledger-cited) | 0% | 0% | 0% | 0% | 0% | **100%** | **100%** |
+| Context tokens (mean) | 12,623 | 131 | 135 | 541 | 479 | 552 | 538 |
+| Query latency mean | 0.06 ms | 28.2 ms | 28.6 ms | 1.9 ms | 1.6 ms | 13.3 ms | 2.8 ms |
+| Ingest per observation | 0.04 ms | 0.23 ms | 0.22 ms | 0.02 ms | 0.01 ms | 3.8 ms (fsync) | shared |
+
+VERITAS's advantage here is structural: its memory never hands the reader a rumor, a stale value or a missing hop.
+The categories show which mechanism matters where:
+
+- **Contested:** source-authority reconciliation.
+- **Point-in-time:** valid-time intervals combined with dates read from the question.
+- **Historical:** closed intervals instead of overwrites.
+- **Multi-hop:** the ego graph.
+
+The caveat in §12.2 (8) applies: the generator's rumors are low-authority, which is the assumption VERITAS's rule makes.
+
+### 11.7 Scaling
+
+`temporal_bench.py --scaling` repeats the benchmark at growing world sizes:
+
+| People | Observations | Facts | Ledger records | Ingest mean / p95 | Chain verify | Query default (mean / p95) | Query optimized (mean / p95) | Context tokens default / optimized | Full-history tokens |
+|---|---|---|---|---|---|---|---|---|---|
+| 100 | 1,533 | 1,214 | 2,294 | 2.8 / 4.6 ms | 190 ms | 34.7 / 46.9 ms | 4.3 / 15.1 ms | 643 / 617 | 32,319 |
+| 400 | 5,959 | 4,755 | 8,918 | 3.4 / 5.2 ms | 779 ms | 196.8 / 379.8 ms | 14.7 / 73.5 ms | 934 / 756 | 128,759 |
+| 1,000 | 14,787 | 11,758 | 22,142 | 3.4 / 5.2 ms | 1,886 ms | 527.6 / 1,000.4 ms | 56.7 / 230.9 ms | 1,187 / 811 | 337,986 |
+
+- **Ingestion** cost per observation is flat (about 3 ms), dominated by the per-transaction fsync (`LEDGER_FSYNC=0`
+  brings it to about 1 ms).
+- **Chain verification** is linear: 1.9 s for 22k records.
+- **Queries:** the default pruner scores every fact, so its latency grows with the history. The optional ego-local
+  mode (§8.1) keeps exactly the same facts at 9x lower mean latency for 11,758 facts.
+- **Context tokens:** with hub damping, context grows from 617 to only 811 tokens over a 10x larger graph, while the
+  full-history prompt grows to 338k tokens.
+
+### 11.8 All eight methods with a real SLM
+
+Same setup as §11.2 (llama3.2 3B Q4_K_M, CPU, temperature 0, cold prompt cache), one repeat over the 11 demo
+questions:
+
+| | A1 full history | A2 vector RAG | A3 hybrid RAG | A4 static graph RAG | A5 overwrite memory | B VERITAS | B2 compact | B3 optimized |
+|---|---|---|---|---|---|---|---|---|
+| Accuracy (11 questions) | 81.8% | 54.5% | 63.6% | 54.5% | 72.7% | **90.9%** | 81.8% | **90.9%** |
+| · changed (5) | 60% | 40% | 40% | 40% | 100% | 100% | 80% | 100% |
+| · historical (3) | 100% | 66.7% | 100% | 66.7% | 0% | 66.7% | 66.7% | 66.7% |
+| · multi-hop (1) | 100% | 0% | 0% | 0% | 100% | 100% | 100% | 100% |
+| Stale / conflicting answers | 18.2% | 18.2% | 18.2% | 36.4% | 0% | 9.1% | 9.1% | 9.1% |
+| Verified citations | n/a | n/a | n/a | n/a | n/a | 100% | 90.9% | 100% |
+| Prompt tokens (model) | 1,757 | 258 | 261 | 438 | 385 | 561 | **149** | 561 |
+| Median latency | 21.4 s | 4.6 s | 4.6 s | 6.0 s | 5.0 s | 8.3 s | **2.3 s** | 8.2 s |
+
+- **VERITAS standard and optimized:** 90.9% each, the highest of the eight methods, with every citation verified
+  against the ledger.
+- **Overwrite memory:** answers changed facts well (100%), but fails every historical question, because the history is
+  gone.
+- **Hybrid retrieval:** improves on dense retrieval (63.6% vs 54.5%), but still surfaces stale values.
+- **Static graph RAG:** the most stale answers (36.4%), because it presents every value a slot ever had as equally
+  current.
+- **Full history:** close in accuracy (81.8%), but at 3x VERITAS's prompt tokens and 2.6x its median latency.
+
+With 11 questions and one repeat, differences of one answer (9 points) are within noise.
 
 ## 12. Current status, limitations and future work
 
@@ -538,8 +689,9 @@ There are 125 `pytest` tests in 10 files, and none needs network access or a mod
 
 1. **Rule-based extraction.** Coverage is limited to the patterns in §7. Paraphrases ("Alice now calls London home"),
    negation ("Alice no longer works at Acme"), quantities and compound sentences are not handled.
-2. **No entity resolution.** "Alice", "Alice Smith" and "A. Smith" are three entities. Aliases and coreference are not
-   merged.
+2. **Limited entity resolution.** Declared aliases and the optional honorific/legal-suffix rule (§7.1) cover the
+   common cases, but "Alice Smith" and "A. Smith" are still two entities unless an alias is declared. There is no
+   coreference resolution, and a link applies only from the moment it is recorded.
 3. **Fixed ontology.** Cardinality is static. Unknown predicates default to functional, which is wrong for genuinely
    multi-valued relations the ontology doesn't know.
 4. **Heuristic authority model.** Source authorities and the 0.35 tolerance are hand-set constants, not learned or
@@ -548,11 +700,14 @@ There are 125 `pytest` tests in 10 files, and none needs network access or a mod
    lists can miss the right relation.
 6. **"End" events are not modelled.** A fact can only be closed by a conflicting replacement. There is no way to say
    "Alice left Acme" without naming a new employer.
-7. **Single-process scale.** The graph is in memory behind one lock, the ledger is a single local file, and the lab
-   runs one job at a time.
-8. **Evaluation scale.** One trajectory, 11 questions and one 3B model. The results are indicative, not a benchmark
-   claim. Ground truth for auto-generated questions comes from VERITAS's own rules, which is circular for evaluating
-   VERITAS. Those questions are fair *between* methods but should be checked by a human.
+7. **Single-process scale per tenant.** Each tenant's graph is in memory behind one lock and its ledger is one local
+   file. Tenants (§10.1) give horizontal scale by sharding, not shared-state replicas. The lab still runs one job at a
+   time.
+8. **Evaluation scale.** The real-model results use one trajectory, 11 questions and one 3B model, so they are
+   indicative, not a benchmark claim. The synthetic benchmark (§11.6) has independent ground truth and scales to
+   thousands of entities, but its generator encodes the same assumption VERITAS makes: rumors come from low-authority
+   sources. A world where a *high*-authority source lies would defeat the authority rule as it stands. Auto-generated
+   Lab questions remain circular and should be checked by a human.
 9. **Integrity, not authenticity.** The hash chain proves the ledger was not altered after writing. It does not prove
    *who* wrote it, because records are not signed.
 
@@ -614,12 +769,17 @@ There are 125 `pytest` tests in 10 files, and none needs network access or a mod
 # backend
 cd backend
 pip install -r requirements-dev.txt
-python -m pytest                         # 125 tests, offline
+python -m pytest                         # 176 tests, offline
 python benchmark.py                      # structural benchmark (§11.1)
+python benchmark.py --all-baselines      # plus hybrid, static graph and overwrite baselines
+python temporal_bench.py                 # synthetic benchmark, independent ground truth (§11.6)
+python temporal_bench.py --scaling 100,400,1000 --questions 30   # scaling (§11.7)
 
 # real-SLM comparison (§11.2), requires Ollama
 ollama pull llama3.2
 python ab_eval.py --model llama3.2 --repeats 3 --num-gpu 0
+python ab_eval.py --model llama3.2 --num-gpu 0 --methods A1,A2,A3,A4,A5,B,B2,B3   # all methods (§11.8)
+python ab_eval.py --model llama3.2 --dataset synthetic --methods A1,A3,A5,B,B3   # synthetic questions
 #   reports → backend/reports/ab_<model>_<timestamp>/{report.json, report.md, veritas_ledger.jsonl}
 
 # app
@@ -627,7 +787,7 @@ uvicorn main:app --port 8000             # LLM_PROVIDER=ollama to use the SLM in
 cd ../frontend && npm install && npm run dev   # http://localhost:5173 → "A/B Lab"
 ```
 
-The harness options are `--methods A1,A2,B,B2`, `--scale N` (a longer history), `--allow-prompt-cache`,
+The harness options are `--methods` (any of A1, A2, A3, A4, A5, B, B2, B3; default A1,A2,B,B2), `--dataset demo|synthetic`, `--scale N` (a longer history), `--allow-prompt-cache`,
 `--num-ctx`, `--provider llamacpp --base-url …` and `--model qwen2.5:3b`.
 
 ---

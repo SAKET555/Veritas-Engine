@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,7 @@ def normalize_predicate(raw: str) -> str:
     return _NORMALIZE_RE.sub("_", raw.strip().lower()).strip("_")
 
 
+@lru_cache(maxsize=4096)
 def get_spec(predicate: str) -> PredicateSpec:
     """Return the spec for a predicate; unknown predicates default to functional.
 
@@ -162,6 +164,7 @@ def get_spec(predicate: str) -> PredicateSpec:
     )
 
 
+@lru_cache(maxsize=4096)
 def predicate_tokens(predicate: str) -> frozenset[str]:
     """All lexical tokens that refer to the predicate (name parts + aliases)."""
     spec = get_spec(predicate)

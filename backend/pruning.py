@@ -27,14 +27,15 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from functools import lru_cache
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
-import networkx as nx
 
 from graph_engine import TemporalGraphEngine
 from models import PruningParams, ScoredEdge, TemporalEdge, ensure_utc
 from ontology import predicate_tokens
+from entity_linking import EntityLinker
 from reconciliation import AuditLedger
 
 _WORD = re.compile(r"[a-z0-9]+")
@@ -57,6 +58,48 @@ def tokenize(text: str) -> set[str]:
     return out
 
 
+_MONTHS = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+     "november", "december"], start=1)}
+_MONTHS.update({m[:3]: i for m, i in list(_MONTHS.items())})
+_MONTHS["sept"] = 9
+_MONTH_RE = "|".join(sorted(_MONTHS, key=len, reverse=True))
+_ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?Z?)?\b")
+_MDY_DATE = re.compile(rf"\b({_MONTH_RE})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b", re.IGNORECASE)
+_DMY_DATE = re.compile(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({_MONTH_RE})\.?,?\s+(\d{{4}})\b", re.IGNORECASE)
+
+
+def extract_as_of(question: str) -> Optional[datetime]:
+    """The valid-time instant a question asks about, if it names a calendar date.
+
+    Recognizes ISO dates (``2026-03-15``, optionally with ``THH:MM``),
+    ``March 15, 2026`` / ``Mar 15 2026`` and ``15 March 2026``. A bare date
+    means midday UTC of that day, so "on 2026-03-01" sees a change recorded at
+    09:00 that day. Returns ``None`` when no unambiguous date is present.
+    """
+    found: list[datetime] = []
+    try:
+        for m in _ISO_DATE.finditer(question):
+            hour, minute, second = int(m.group(4) or 12), int(m.group(5) or 0), int(m.group(6) or 0)
+            found.append(datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), hour, minute, second,
+                                  tzinfo=timezone.utc))
+        for m in _MDY_DATE.finditer(question):
+            found.append(datetime(int(m.group(3)), _MONTHS[m.group(1).lower()], int(m.group(2)), 12,
+                                  tzinfo=timezone.utc))
+        for m in _DMY_DATE.finditer(question):
+            found.append(datetime(int(m.group(3)), _MONTHS[m.group(2).lower()], int(m.group(1)), 12,
+                                  tzinfo=timezone.utc))
+    except ValueError:  # e.g. February 30
+        return None
+    unique = set(found)
+    return found[0] if len(unique) == 1 else None
+
+
+@lru_cache(maxsize=65536)
+def _name_tokens(name: str) -> frozenset[str]:
+    return frozenset(tokenize(name))
+
+
 def fmt_ts(ts: Optional[datetime]) -> str:
     if ts is None:
         return "now"
@@ -75,12 +118,23 @@ class PrunedContext:
     scored: list[ScoredEdge]
     citations: dict[str, str]  # short mutation id -> edge id
     reference_time: Optional[datetime]
+    # Facts that provably cannot reach τ (outside the ego graph, or too weakly connected to it)
+    # are dropped without a score record, so a query costs O(ego) instead of O(|history|).
+    unscored: int = 0
 
 
 class SubgraphPruner:
-    def __init__(self, graph: TemporalGraphEngine, ledger: AuditLedger) -> None:
+    def __init__(self, graph: TemporalGraphEngine, ledger: AuditLedger,
+                 linker: Optional[EntityLinker] = None) -> None:
         self.graph = graph
         self.ledger = ledger
+        self.linker = linker
+
+    def _alias_surfaces(self) -> list[tuple[str, str]]:
+        """(alias name, canonical entity id) for every alias whose canonical entity exists."""
+        if self.linker is None:
+            return []
+        return [(a.alias, a.canonical_id) for a in self.linker.aliases() if self.graph.get_entity(a.canonical_id)]
 
     # ------------------------------------------------------------------ #
     # Seeds & intent
@@ -95,20 +149,26 @@ class SubgraphPruner:
                     if entity.id == key or entity.name.lower() == key:
                         resolved.append(entity.id)
                         break
+                else:
+                    resolved.extend(cid for alias, cid in self._alias_surfaces()
+                                    if alias.lower() == key and cid not in resolved)
             return resolved
 
         lowered = question.lower()
         found: list[str] = []
         claimed: list[tuple[int, int]] = []
-        for entity in sorted(self.graph.entities(), key=lambda e: len(e.name), reverse=True):
-            pattern = r"(?<![a-z0-9])" + re.escape(entity.name.lower()) + r"(?:'s)?(?![a-z0-9])"
+        surfaces = [(e.name, e.id) for e in self.graph.entities()] + self._alias_surfaces()
+        for name, entity_id in sorted(surfaces, key=lambda pair: len(pair[0]), reverse=True):
+            if name.lower() not in lowered:  # cheap filter before compiling a pattern
+                continue
+            pattern = r"(?<![a-z0-9])" + re.escape(name.lower()) + r"(?:'s)?(?![a-z0-9])"
             for match in re.finditer(pattern, lowered):
                 span = match.span()
                 if any(span[0] < end and start < span[1] for start, end in claimed):
                     continue
                 claimed.append(span)
-                if entity.id not in found:
-                    found.append(entity.id)
+                if entity_id not in found:
+                    found.append(entity_id)
         return found
 
     @staticmethod
@@ -135,31 +195,55 @@ class SubgraphPruner:
         )
         seed_ids = seeds if seeds is not None else self.resolve_seeds(question)
 
-        universe = self.graph.history_subgraph(as_of)
-        all_edges: list[TemporalEdge] = [d["data"] for _, _, d in universe.edges(data=True)]
+        def visible(edge: TemporalEdge) -> bool:
+            # Every fact that had started by as_of (the universe of graph.history_subgraph(as_of)).
+            return as_of is None or edge.t_start <= as_of
 
         def current(edge: TemporalEdge) -> bool:
             return edge.valid_at(as_of) if as_of else edge.is_active
 
-        traversal = nx.MultiDiGraph()
-        traversal.add_nodes_from(universe.nodes)
-        for edge in all_edges:
-            if include_history or current(edge):
-                traversal.add_edge(edge.source_id, edge.target_id, key=edge.id)
-
-        weights = self._path_weights(traversal, seed_ids, params)
-        reference = as_of or max((self._last_valid(e, None) for e in all_edges), default=None)
-        q_tokens = tokenize(question)
-        # A question that names no relation at all ("Tell me about Alice") carries no
-        # relational signal, so every relation is treated as lexically relevant.
-        lexical_neutral = not any(predicate_tokens(e.relation) & q_tokens for e in all_edges)
+        def traversable(edge: TemporalEdge) -> bool:
+            return visible(edge) and (include_history or current(edge))
 
         weight_sum = params.alpha + params.beta + params.gamma
         if weight_sum <= 0:
             raise ValueError("alpha + beta + gamma must be positive")
+        # Upper bound on what any fact can score is (α + β + γ·structural)/Σ, since confidence and
+        # recency are ≤ 1 and relevance ≤ structural. A fact whose structural weight is below w_min
+        # can never reach τ, so it is dropped without a score record (counted in ``unscored``).
+        w_min = (params.tau * weight_sum - params.alpha - params.beta) / params.gamma if params.gamma > 0 else 0.0
+
+        if seed_ids and params.candidate_mode == "ego":
+            weights, damp, candidates = self._ego(seed_ids, params, visible, traversable, w_min)
+            relations = self.graph.relations()
+            reference = as_of or self.graph.latest_time_point()
+            if as_of is None:
+                total = self.graph.stats()["edges_total"]
+            else:
+                total = sum(1 for e in self.graph.all_edges() if visible(e))
+        elif seed_ids:
+            # Default ("all"): score every fact in the universe, exactly as before; the ego walk
+            # only supplies path weights (with no τ cut-off, so every reachable node is expanded).
+            candidates = [e for e in self.graph.all_edges() if visible(e)]
+            weights, damp, _ = self._ego(seed_ids, params, visible, traversable, float("-inf"), collect=False)
+            relations = {e.relation for e in candidates}
+            reference = as_of or max((self._last_valid(e, None) for e in candidates), default=None)
+            total = len(candidates)
+        else:
+            # No anchor: every node is equally (and only moderately) relevant.
+            candidates = [e for e in self.graph.all_edges() if visible(e)]
+            weights = {n: 0.5 for e in candidates for n in (e.source_id, e.target_id)}
+            damp = {}
+            relations = {e.relation for e in candidates}
+            reference = as_of or max((self._last_valid(e, None) for e in candidates), default=None)
+            total = len(candidates)
+        q_tokens = tokenize(question)
+        # A question that names no relation at all ("Tell me about Alice") carries no
+        # relational signal, so every relation is treated as lexically relevant.
+        lexical_neutral = not any(predicate_tokens(r) & q_tokens for r in relations)
 
         scored: list[tuple[ScoredEdge, TemporalEdge]] = []
-        for edge in all_edges:
+        for edge in candidates:
             src_w = weights.get(edge.source_id)
             tgt_w = weights.get(edge.target_id)
             in_ego = src_w is not None and tgt_w is not None
@@ -167,10 +251,11 @@ class SubgraphPruner:
 
             structural = 0.0
             if in_ego:
-                structural = max(src_w or 0.0, (tgt_w or 0.0) * params.reverse_edge_penalty)
+                reverse = (tgt_w or 0.0) * params.reverse_edge_penalty / damp.get(edge.target_id, 1.0)
+                structural = max(src_w or 0.0, reverse)
             lexical = 1.0 if lexical_neutral or predicate_tokens(edge.relation) & q_tokens else 0.0
             target_entity = self.graph.get_entity(edge.target_id)
-            if lexical == 0.0 and target_entity and tokenize(target_entity.name) <= q_tokens:
+            if lexical == 0.0 and target_entity and _name_tokens(target_entity.name) <= q_tokens:
                 lexical = 0.5
             relevance = structural * (0.3 + 0.7 * lexical)
             recency = self._recency(edge, reference, params.recency_half_life_days)
@@ -205,6 +290,7 @@ class SubgraphPruner:
                 ),
                 edge,
             ))
+        unscored = total - len(candidates)
 
         scored.sort(key=lambda pair: (pair[0].kept, pair[0].score), reverse=True)
         kept_edges: list[TemporalEdge] = []
@@ -228,34 +314,83 @@ class SubgraphPruner:
             scored=final_scored,
             citations=citations,
             reference_time=reference,
+            unscored=unscored,
         )
 
-    def _path_weights(
-        self, graph: nx.MultiDiGraph, seeds: list[str], params: PruningParams
-    ) -> dict[str, float]:
-        if not seeds:
-            # No anchor: every node is equally (and only moderately) relevant.
-            return {node: 0.5 for node in graph.nodes}
-        weights = {s: 1.0 for s in seeds if s in graph}
+    def _ego(
+        self,
+        seeds: list[str],
+        params: PruningParams,
+        visible,  # type: ignore[no-untyped-def]
+        traversable,  # type: ignore[no-untyped-def]
+        w_min: float,
+        *,
+        collect: bool = True,
+    ) -> tuple[dict[str, float], dict[str, float], list[TemporalEdge]]:
+        """Radius-k weighted expansion over the engine's adjacency, touching only the ego neighbourhood.
+
+        Returns ``(path weights, hub damping per node, candidate facts)``. Path weights follow the
+        module docstring; in addition, walking an edge *backwards* out of a non-seed node with
+        fan-in ``d > 1`` is divided by ``d ** hub_damping``, so a city or employer shared by
+        thousands of people does not pull all of them into every question about one person.
+        Nodes whose weight is below ``w_min`` are not expanded: nothing past them can reach τ.
+        """
+        seed_set = set(seeds)
+        incident: dict[str, list[TemporalEdge]] = {}
+
+        def edges_of(node: str) -> list[TemporalEdge]:
+            if node not in incident:
+                incident[node] = [e for e in self.graph.incident_edges(node) if visible(e)]
+            return incident[node]
+
+        damp: dict[str, float] = {}
+
+        def damping(node: str) -> float:
+            if node not in damp:
+                fan_in = sum(1 for e in edges_of(node) if e.target_id == node and traversable(e))
+                damp[node] = fan_in ** params.hub_damping if fan_in > 1 and node not in seed_set else 1.0
+            return damp[node]
+
+        weights = {s: 1.0 for s in seeds if edges_of(s)}
         frontier = set(weights)
         for _ in range(params.k_hops):
             updated: set[str] = set()
             for u in frontier:
                 base = weights[u]
-                for _, v in graph.out_edges(u):
-                    cand = base * params.hop_decay
-                    if cand > weights.get(v, 0.0):
-                        weights[v] = cand
-                        updated.add(v)
-                for v, _ in graph.in_edges(u):
-                    cand = base * params.hop_decay * params.reverse_edge_penalty
+                if base < w_min:
+                    continue
+                for e in edges_of(u):
+                    if not traversable(e):
+                        continue
+                    if e.source_id == u:
+                        v, cand = e.target_id, base * params.hop_decay
+                    else:
+                        v, cand = e.source_id, base * params.hop_decay * params.reverse_edge_penalty / damping(u)
                     if cand > weights.get(v, 0.0):
                         weights[v] = cand
                         updated.add(v)
             if not updated:
                 break
             frontier = updated
-        return weights
+
+        if not collect:
+            for node in weights:
+                damping(node)
+            return weights, damp, []
+        candidates: dict[str, TemporalEdge] = {}
+        for node, weight in weights.items():
+            if weight < w_min and node not in seed_set:
+                # A fact can only pass τ through a strong endpoint, and is collected from that one.
+                continue
+            for e in edges_of(node):
+                if e.id in candidates:
+                    continue
+                src_w = weights.get(e.source_id, 0.0)
+                tgt_w = weights.get(e.target_id, 0.0) * params.reverse_edge_penalty / damping(e.target_id)
+                if max(src_w, tgt_w) >= w_min or e.source_id in seed_set or e.target_id in seed_set:
+                    candidates[e.id] = e
+        ordered = sorted(candidates.values(), key=lambda e: self.graph.edge_order(e.id))
+        return weights, damp, ordered
 
     @staticmethod
     def _last_valid(edge: TemporalEdge, reference: Optional[datetime]) -> datetime:

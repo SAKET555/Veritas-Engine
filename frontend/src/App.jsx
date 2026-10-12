@@ -22,6 +22,7 @@ import ObservePanel from "./components/ObservePanel.jsx";
 import QueryPanel from "./components/QueryPanel.jsx";
 import QueryResults from "./components/QueryResults.jsx";
 import ABLab from "./lab/ABLab.jsx";
+import WorkspaceControl from "./components/WorkspaceControl.jsx";
 
 function Stat({ label, value, tone = "text-slate-100" }) {
   return (
@@ -165,6 +166,14 @@ export default function App() {
           ))}
         </nav>
         <div className="ml-auto flex gap-2">
+          <WorkspaceControl
+            tenant={health?.tenant && health.tenant !== "default" ? health.tenant : ""}
+            onChange={() => {
+              setSelectedId(null);
+              setQueryResult(null);
+              setRevision((r) => r + 1);
+            }}
+          />
           <button type="button" className="btn-ghost" onClick={() => runAdmin("seed")} disabled={!!busy}>
             {busy === "seed" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
             Load demo trajectory

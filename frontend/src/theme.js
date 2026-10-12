@@ -24,6 +24,7 @@ export const MUTATION_STYLES = {
   INSERT: "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30",
   INVALIDATE: "bg-rose-500/15 text-rose-300 ring-1 ring-rose-500/30",
   RECONCILE: "bg-sky-500/15 text-sky-300 ring-1 ring-sky-500/30",
+  ALIAS: "bg-fuchsia-500/15 text-fuchsia-300 ring-1 ring-fuchsia-500/30",
 };
 
 export const DECISION_STYLES = {

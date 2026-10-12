@@ -69,7 +69,7 @@ export default function QueryResults({ result, onCitationClick }) {
   const [showScores, setShowScores] = useState(false);
   const m = result.metrics;
   const kept = result.scored_edges.filter((e) => e.kept);
-  const dropped = result.scored_edges.length - kept.length;
+  const dropped = result.scored_edges.length - kept.length + (m.edges_unscored || 0);
 
   return (
     <section className="grid gap-3 lg:grid-cols-3">

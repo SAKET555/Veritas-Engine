@@ -20,8 +20,9 @@ Design notes
 
 from __future__ import annotations
 
+import heapq
 import threading
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Iterable, Optional
 
@@ -34,12 +35,51 @@ class GraphEngineError(RuntimeError):
     """Raised on illegal temporal operations (unknown edge, double close, ...)."""
 
 
+class _MaxMultiset:
+    """Multiset of datetimes with O(log n) insert/remove and amortized O(1) max (lazy-deletion heap)."""
+
+    def __init__(self) -> None:
+        self._heap: list[float] = []
+        self._count: Counter[float] = Counter()
+        self._values: dict[float, datetime] = {}
+
+    def add(self, value: datetime) -> None:
+        key = value.timestamp()
+        self._values[key] = value
+        self._count[key] += 1
+        heapq.heappush(self._heap, -key)
+
+    def discard(self, value: datetime) -> None:
+        key = value.timestamp()
+        if self._count[key] > 0:
+            self._count[key] -= 1
+
+    def max(self) -> Optional[datetime]:
+        while self._heap and self._count[-self._heap[0]] <= 0:
+            heapq.heappop(self._heap)
+        return self._values[-self._heap[0]] if self._heap else None
+
+    def clear(self) -> None:
+        self._heap.clear()
+        self._count.clear()
+        self._values.clear()
+
+
+def _last_point(edge: TemporalEdge) -> datetime:
+    return edge.t_end if edge.t_end is not None else edge.t_start
+
+
 class TemporalGraphEngine:
     def __init__(self) -> None:
         self._g: nx.MultiDiGraph = nx.MultiDiGraph()
         self._edge_index: dict[str, tuple[str, str]] = {}
         self._active: set[str] = set()
         self._by_subject_relation: dict[tuple[str, str], set[str]] = defaultdict(set)
+        # Query-planning indexes: insertion order, relation vocabulary and the latest valid-time point.
+        self._order: dict[str, int] = {}
+        self._next_order = 0
+        self._relation_counts: Counter[str] = Counter()
+        self._time_points = _MaxMultiset()
         self.lock = threading.RLock()
 
     # ------------------------------------------------------------------ #
@@ -154,11 +194,18 @@ class TemporalGraphEngine:
             old_u, old_v = self._edge_index[edge.id]
             if (old_u, old_v) != (edge.source_id, edge.target_id):
                 raise GraphEngineError(f"Edge {edge.id} cannot change endpoints")
+            previous: TemporalEdge = self._g.edges[old_u, old_v, edge.id]["data"]
+            self._time_points.discard(_last_point(previous))
             self._g.edges[old_u, old_v, edge.id]["data"] = edge
         else:
             self._g.add_edge(edge.source_id, edge.target_id, key=edge.id, data=edge)
             self._edge_index[edge.id] = (edge.source_id, edge.target_id)
             self._by_subject_relation[(edge.source_id, edge.relation)].add(edge.id)
+            self._relation_counts[edge.relation] += 1
+            if edge.id not in self._order:
+                self._order[edge.id] = self._next_order
+                self._next_order += 1
+        self._time_points.add(_last_point(edge))
         if edge.is_active:
             self._active.add(edge.id)
         else:
@@ -182,6 +229,11 @@ class TemporalGraphEngine:
             self._g.remove_edge(u, v, key=edge_id)
             self._active.discard(edge_id)
             self._by_subject_relation[(edge.source_id, edge.relation)].discard(edge_id)
+            self._relation_counts[edge.relation] -= 1
+            if self._relation_counts[edge.relation] <= 0:
+                del self._relation_counts[edge.relation]
+            self._time_points.discard(_last_point(edge))
+            self._order.pop(edge_id, None)
 
     def get_edge(self, edge_id: str) -> TemporalEdge:
         with self.lock:
@@ -197,6 +249,29 @@ class TemporalGraphEngine:
     def all_edges(self) -> list[TemporalEdge]:
         with self.lock:
             return [data["data"] for _, _, data in self._g.edges(data=True)]
+
+    def incident_edges(self, node_id: str) -> list[TemporalEdge]:
+        """Every fact (any validity) with ``node_id`` as subject or object."""
+        with self.lock:
+            if node_id not in self._g:
+                return []
+            out = [d["data"] for _, _, d in self._g.out_edges(node_id, data=True)]
+            out.extend(d["data"] for _, _, d in self._g.in_edges(node_id, data=True))
+            return out
+
+    def edge_order(self, edge_id: str) -> int:
+        """Insertion ordinal of an edge (stable tie-breaker for query planning)."""
+        return self._order.get(edge_id, -1)
+
+    def relations(self) -> set[str]:
+        """Every relation that labels at least one recorded fact."""
+        with self.lock:
+            return set(self._relation_counts)
+
+    def latest_time_point(self) -> Optional[datetime]:
+        """The latest t_start or t_end of any fact: the default reference time for recency."""
+        with self.lock:
+            return self._time_points.max()
 
     def edges_for(self, source_id: str, relation: str) -> list[TemporalEdge]:
         """All facts (any validity) for a (subject, predicate) pair, oldest first."""
@@ -352,3 +427,7 @@ class TemporalGraphEngine:
             self._edge_index.clear()
             self._active.clear()
             self._by_subject_relation.clear()
+            self._order.clear()
+            self._next_order = 0
+            self._relation_counts.clear()
+            self._time_points.clear()

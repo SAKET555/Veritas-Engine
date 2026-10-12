@@ -1,0 +1,52 @@
+# VERITAS: API + dashboard (+ optional local SLM).
+#
+#   docker compose up --build                       # mock reader, dashboard on http://localhost:8080
+#   docker compose --profile llm up --build         # also start Ollama; then:
+#   docker compose exec ollama ollama pull llama3.2
+#   LLM_PROVIDER=ollama docker compose --profile llm up -d backend
+#
+# Optional settings (export or put in a .env file next to this file):
+#   VERITAS_API_KEYS=key1,key2:acme   require API keys (key2 is bound to tenant "acme")
+#   ENTITY_LINKING=auto               also auto-link "Acme Inc." to an existing "Acme"
+#   LEDGER_FSYNC=0                    trade per-transaction durability for ingest throughput
+services:
+  backend:
+    build: ./backend
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_MODEL: ${LLM_MODEL:-llama3.2}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
+      VERITAS_API_KEYS: ${VERITAS_API_KEYS:-}
+      ENTITY_LINKING: ${ENTITY_LINKING:-explicit}
+      LEDGER_FSYNC: ${LEDGER_FSYNC:-1}
+      MAX_TENANTS: ${MAX_TENANTS:-100}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - veritas-data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:0.5.7
+    profiles: ["llm"]
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+volumes:
+  veritas-data:
+  ollama-models:

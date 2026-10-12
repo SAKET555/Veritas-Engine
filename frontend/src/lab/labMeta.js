@@ -19,6 +19,33 @@ export const METHODS = {
     explain:
       "Stores every fact and, for each question, pulls out the few that look most similar to the question. It is cheap, but it does not know which facts are out of date, and it can miss the one that matters.",
   },
+  A3: {
+    name: "Hybrid search (BM25 + vector)",
+    short: "A3",
+    color: "#f472b6",
+    bar: "bg-pink-500",
+    text: "text-pink-300",
+    explain:
+      "The setup most production RAG systems use: keyword search (BM25) and vector search, merged by rank. It finds exact names better than vector search alone, but still has no idea which facts are out of date.",
+  },
+  A4: {
+    name: "Graph RAG (no time)",
+    short: "A4",
+    color: "#fb923c",
+    bar: "bg-orange-500",
+    text: "text-orange-300",
+    explain:
+      "Puts the same facts in a knowledge graph and hands the model the neighbourhood of the people and things in the question. The graph has no notion of time, so every value a fact ever had is listed and none is marked as old.",
+  },
+  A5: {
+    name: "Overwrite memory (no audit)",
+    short: "A5",
+    color: "#94a3b8",
+    bar: "bg-slate-400",
+    text: "text-slate-300",
+    explain:
+      "Keeps one current value per fact and simply overwrites it with whatever arrived last, like many agent-memory layers. No history, no source trust, no ledger: a late rumor or an old record replaces the truth, and nothing can be cited.",
+  },
   B: {
     name: "VERITAS (standard)",
     short: "B",
@@ -37,6 +64,16 @@ export const METHODS = {
     explain:
       "Exactly the same facts as standard VERITAS, written more briefly: short instructions, [1]-style citation tags that the server maps back to the ledger, and \"replaced by\" notes on old facts. The written reasons stay in the ledger instead of the prompt.",
   },
+};
+
+METHODS.B3 = {
+  name: "VERITAS (optimized)",
+  short: "B3",
+  color: "#22d3ee",
+  bar: "bg-cyan-400",
+  text: "text-cyan-300",
+  explain:
+    "Standard VERITAS with the optional retrieval settings switched on: only the question's neighbourhood is scored (faster on big graphs), crowded hubs such as a city everyone lives in are damped, and a date in the question (\"on March 3, 2025\") is answered as of that date.",
 };
 
 export const METRICS = [
@@ -92,6 +129,8 @@ export const CATEGORY_HELP = {
   historical: "Asks what a value was before a change.",
   stable: "The fact never changed (a control question).",
   "multi-hop": "Needs two facts joined together.",
+  contested: "A low-trust rumor contradicted the fact; asks for the true current value.",
+  "point-in-time": "Asks for the value on a specific past date.",
 };
 
 export function metricValue(summary, key) {

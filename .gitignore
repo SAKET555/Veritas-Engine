@@ -8,3 +8,4 @@ frontend/dist/
 backend/reports/
 .pytest_cache/
 *.egg-info/
+backend/data/tenants/

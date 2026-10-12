@@ -51,6 +51,7 @@ from models import (
     new_uuid,
     utc_now,
 )
+from entity_linking import AliasLink, EntityLinker
 from ontology import PredicateSpec, get_spec
 
 GENESIS_HASH = "0" * 64
@@ -100,8 +101,11 @@ class _Draft:
 class AuditLedger:
     """Sequential JSONL ledger with a SHA-256 hash chain."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, fsync: bool = True) -> None:
         self.path = Path(path)
+        # fsync after every transaction makes each committed mutation durable across power loss.
+        # Turning it off trades that guarantee for throughput (the OS still flushes eventually).
+        self.fsync = fsync
         self._records: list[MutationAuditRecord] = []
         self._by_edge: dict[str, list[MutationAuditRecord]] = {}
         self._by_short: dict[str, MutationAuditRecord] = {}
@@ -171,7 +175,8 @@ class AuditLedger:
                     for record in sealed:
                         fh.write(record.model_dump_json() + "\n")
                     fh.flush()
-                    os.fsync(fh.fileno())
+                    if self.fsync:
+                        os.fsync(fh.fileno())
             except OSError:
                 if self.path.exists():
                     with self.path.open("r+b") as fh:
@@ -285,30 +290,37 @@ class ReconciliationEngine:
         ledger: AuditLedger,
         *,
         supersession_tolerance: float = 0.35,
+        linker: Optional[EntityLinker] = None,
     ) -> None:
         if not 0.0 <= supersession_tolerance < 1.0:
             raise ValueError("supersession_tolerance must be in [0, 1)")
         self.graph = graph
         self.ledger = ledger
         self.tolerance = supersession_tolerance
+        self.linker = linker
 
     # -- public API -------------------------------------------------------- #
 
     def ingest(self, obs: TripleObservation) -> ReconciliationOutcome:
         spec = get_spec(obs.predicate)
-        subject_id = entity_id_for(obs.subject)
-        object_id = entity_id_for(obs.object)
-        if subject_id == object_id:
-            raise ValueError(f"Self-referential triple rejected: {obs.subject!r} {spec.name} {obs.object!r}")
-
         with self.graph.lock:
             txn = _Transaction(transaction_id=new_uuid())
             try:
+                obs = self._link_entities(txn, obs)
+                subject_id = entity_id_for(obs.subject)
+                object_id = entity_id_for(obs.object)
+                if subject_id == object_id:
+                    raise ValueError(f"Self-referential triple rejected: {obs.subject!r} {spec.name} {obs.object!r}")
                 decision, active_id, summary = self._decide_and_apply(txn, obs, spec, subject_id, object_id)
                 records = self.ledger.append_batch(txn.drafts)
             except Exception:
                 txn.rollback()
                 raise
+            if self.linker is not None:
+                for eid in (subject_id, object_id):
+                    entity = self.graph.get_entity(eid)
+                    if entity is not None:
+                        self.linker.note_entity(eid, entity.name)
         return ReconciliationOutcome(
             triple=obs,
             decision=decision,
@@ -318,6 +330,52 @@ class ReconciliationEngine:
             summary=summary,
         )
 
+    def declare_alias(self, alias: str, canonical: str) -> MutationAuditRecord:
+        """Commit an operator-declared alias as an ALIAS ledger record, then apply it."""
+        if self.linker is None:
+            raise ValueError("Entity linking is not enabled for this engine")
+        with self.graph.lock:
+            link = self.linker.declare(alias, canonical)
+            txn = _Transaction(transaction_id=new_uuid())
+            self._alias_draft(txn, link)
+            (record,) = self.ledger.append_batch(txn.drafts)
+            self.linker.restore(link.snapshot())
+            return record
+
+    def _link_entities(self, txn: _Transaction, obs: TripleObservation) -> TripleObservation:
+        """Resolve subject and object through the linker; record any new automatic link."""
+        if self.linker is None:
+            return obs
+
+        def lookup(eid: str) -> Optional[str]:
+            entity = self.graph.get_entity(eid)
+            return entity.name if entity else None
+
+        updates: dict[str, str] = {}
+        for field_name in ("subject", "object"):
+            surface = getattr(obs, field_name)
+            canonical, link = self.linker.resolve(surface, lookup)
+            if link is not None:
+                txn.undo.append(lambda alias_id=link.alias_id: self.linker.remove(alias_id))  # type: ignore[union-attr]
+                self._alias_draft(txn, link)
+            if canonical != surface:
+                updates[field_name] = canonical
+        return obs.model_copy(update=updates) if updates else obs
+
+    def _alias_draft(self, txn: _Transaction, link: AliasLink) -> None:
+        txn.drafts.append(
+            _Draft(
+                transaction_id=txn.transaction_id,
+                timestamp=utc_now(),
+                mutation_type="ALIAS",
+                affected_edge_id=f"alias:{link.alias_id}",
+                entity_ids=[link.alias_id, link.canonical_id],
+                rationale=link.rationale,
+                prior=None,
+                new=link.snapshot(),
+            )
+        )
+
     def get_provenance_trail(self, entity_id: str) -> ProvenanceTrail:
         entity = self.graph.get_entity(entity_id)
         if entity is None:
@@ -325,6 +383,13 @@ class ReconciliationEngine:
         entries: list[ProvenanceEntry] = []
         for record in self.ledger.for_entity(entity_id):
             snap = record.new_state_snapshot
+            if record.mutation_type == "ALIAS":
+                a = snap["alias"]
+                entries.append(ProvenanceEntry(record=record, narrative=(
+                    f"#{record.sequence} [{record.short_id}] {record.timestamp.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"ALIAS ({a['mode']}): '{a['alias']}' → '{a['canonical']}' — {record.deterministic_rationale}"
+                )))
+                continue
             edge = snap["edge"]
             src = snap["source_entity"]["name"]
             tgt = snap["target_entity"]["name"]
@@ -341,13 +406,23 @@ class ReconciliationEngine:
         with self.graph.lock:
             self.graph.clear()
             applied = 0
+            if self.linker is not None:
+                self.linker.clear()
             for record in self.ledger.records():
                 snap = record.new_state_snapshot
+                if record.mutation_type == "ALIAS":
+                    if self.linker is not None:
+                        self.linker.restore(snap)
+                    applied += 1
+                    continue
                 # Entities only ever get refined (specific type, earlier first_seen),
                 # so the most recent snapshot is always the most complete one.
                 for key in ("source_entity", "target_entity"):
                     self.graph.restore_entity(EntityNode.model_validate(snap[key]))
                 self.graph.restore_edge(TemporalEdge.model_validate(snap["edge"]))
+                if self.linker is not None:
+                    for key in ("source_entity", "target_entity"):
+                        self.linker.note_entity(snap[key]["id"], snap[key]["name"])
                 applied += 1
             return applied
 
