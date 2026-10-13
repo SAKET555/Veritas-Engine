@@ -75,11 +75,12 @@ class VeritasRetriever:
 
     label = "VERITAS"
 
-    def __init__(self, ledger_path: Path, *, fsync: bool = True, pruning: Optional[PruningParams] = None) -> None:
+    def __init__(self, ledger_path: Path, *, fsync: bool = True, pruning: Optional[PruningParams] = None,
+                 **engine_options) -> None:  # type: ignore[no-untyped-def]
         self.pruning = pruning or PruningParams()
         self.graph = TemporalGraphEngine()
         self.ledger = AuditLedger(ledger_path, fsync=fsync)
-        self.reconciler = ReconciliationEngine(self.graph, self.ledger)
+        self.reconciler = ReconciliationEngine(self.graph, self.ledger, **engine_options)
         self.pruner = SubgraphPruner(self.graph, self.ledger)
         self.agent = VerifiableAgent(self.pruner, self.ledger, MockLLMClient())
         self.decisions: dict[str, int] = {}
@@ -247,10 +248,12 @@ def _pctl(values: Sequence[float], q: float) -> float:
 
 
 def evaluate(dataset: Dataset, *, top_k: int = 6, fsync: bool = True, workdir: Optional[Path] = None,
-             methods: Optional[Sequence[str]] = None) -> dict:
-    """Ingest the dataset into every method, ask every question and aggregate the metrics."""
+             methods: Optional[Sequence[str]] = None, memories: Optional[dict] = None) -> dict:
+    """Ingest the dataset into every method, ask every question and aggregate the metrics.
+
+    ``memories`` replaces the standard method set (used by ``experiments.py`` for ablations)."""
     workdir = Path(workdir or tempfile.mkdtemp(prefix="veritas-tbench-"))
-    memories = build_methods(workdir, top_k=top_k, fsync=fsync)
+    memories = memories if memories is not None else build_methods(workdir, top_k=top_k, fsync=fsync)
     if methods:
         memories = {k: v for k, v in memories.items() if k in methods}
 
@@ -263,8 +266,8 @@ def evaluate(dataset: Dataset, *, top_k: int = 6, fsync: bool = True, workdir: O
             memory.ingest(obs, triples)  # type: ignore[attr-defined]
             ingest_ms[key].append((time.perf_counter() - started) * 1000.0)
 
-    veritas = memories.get("veritas")
-    chain = veritas.ledger.verify() if isinstance(veritas, VeritasRetriever) else None
+    veritas = memories.get("veritas") or next((m for m in memories.values() if isinstance(m, VeritasRetriever)), None)
+    chains = {key: m.ledger.verify() for key, m in memories.items() if isinstance(m, VeritasRetriever)}
     outcomes: list[Outcome] = []
     for q in dataset.questions:
         for key, memory in memories.items():
@@ -274,7 +277,7 @@ def evaluate(dataset: Dataset, *, top_k: int = 6, fsync: bool = True, workdir: O
             fact, support = read(retrieval.facts, q)
             answer = fact.object if fact else None
             values = {_norm(f.object) for f in retrieval.facts}
-            verifiable = (isinstance(memory, VeritasRetriever) and bool(chain and chain.valid)
+            verifiable = (isinstance(memory, VeritasRetriever) and chains[key].valid
                           and bool(support) and fact is not None and all(memory.verifies(f) for f in support))
             extra = {}
             if isinstance(memory, VeritasRetriever):
@@ -304,7 +307,7 @@ def evaluate(dataset: Dataset, *, top_k: int = 6, fsync: bool = True, workdir: O
             if rows:
                 by_cat[cat] = sum(o.correct for o in rows) / len(rows)
         entry = {
-            "label": METHOD_LABELS[key],
+            "label": METHOD_LABELS.get(key, key),
             "n": len(mine),
             "accuracy": sum(o.correct for o in mine) / n,
             "accuracy_by_category": by_cat,

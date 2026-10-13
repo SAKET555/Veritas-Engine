@@ -291,6 +291,7 @@ class ReconciliationEngine:
         *,
         supersession_tolerance: float = 0.35,
         linker: Optional[EntityLinker] = None,
+        authority: Optional[Callable[[str], float]] = None,
     ) -> None:
         if not 0.0 <= supersession_tolerance < 1.0:
             raise ValueError("supersession_tolerance must be in [0, 1)")
@@ -298,6 +299,8 @@ class ReconciliationEngine:
         self.ledger = ledger
         self.tolerance = supersession_tolerance
         self.linker = linker
+        # Source-authority lookup; replaceable for experiments (e.g. an ablation with every source equal).
+        self.authority = authority or authority_of
 
     # -- public API -------------------------------------------------------- #
 
@@ -440,7 +443,7 @@ class ReconciliationEngine:
         history = self.graph.edges_for(subject_id, spec.name)
         active = [e for e in history if e.is_active]
         triple_txt = f"({obs.subject}, {spec.name}, {obs.object})"
-        eff_new = obs.confidence * authority_of(obs.source)
+        eff_new = obs.confidence * self.authority(obs.source)
 
         # R1: corroboration of an identical active fact
         same = next((e for e in active if e.target_id == object_id), None)
@@ -480,7 +483,7 @@ class ReconciliationEngine:
 
         # R4: conflict with incumbent(s)
         incumbent = max(active, key=lambda e: (e.t_start, e.recorded_at))
-        eff_old = incumbent.confidence_score * authority_of(incumbent.source)
+        eff_old = incumbent.confidence_score * self.authority(incumbent.source)
         incumbent_name = self._name(incumbent.target_id)
         tie = ts == incumbent.t_start
         if tie:
@@ -500,7 +503,7 @@ class ReconciliationEngine:
                 rationale=(
                     f"Rejected candidate {triple_txt}; incumbent ({obs.subject}, {spec.name}, "
                     f"{incumbent_name}) retained: {rule} — failed. Candidate source "
-                    f"'{obs.source}' (authority {authority_of(obs.source):.2f}) × confidence "
+                    f"'{obs.source}' (authority {self.authority(obs.source):.2f}) × confidence "
                     f"{obs.confidence:.2f}. Provenance {obs.provenance_id} logged; no state change.{prior_note}"
                 ),
             )

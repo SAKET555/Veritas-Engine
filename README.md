@@ -52,6 +52,7 @@ The bi-temporal model itself comes from temporal-database research (Snodgrass, 1
 | `backend/baselines.py` | Comparison memories: vector RAG, hybrid BM25 + dense RAG, static graph RAG, overwrite memory, full history |
 | `backend/datasets.py` | Synthetic multi-session benchmark with independent ground truth (rumors, late arrivals, dated questions) |
 | `backend/temporal_bench.py` | Offline benchmark of VERITAS vs every baseline, plus a latency/token scaling mode |
+| `backend/experiments.py` | Multi-seed confidence intervals, ablations, pruning sweep, adversarial sources |
 | `backend/entity_linking.py` | Auditable entity linking (declared aliases, optional automatic normalization) |
 | `backend/observability.py` | Prometheus metrics without extra dependencies |
 | `docker-compose.yml`, `*/Dockerfile` | Container deployment (API, dashboard behind nginx, optional Ollama) |
@@ -106,7 +107,7 @@ origin, set `VITE_API_BASE=https://api.example.com` at build time.
 ```bash
 cd backend
 pip install -r requirements-dev.txt
-python -m pytest            # 176 tests, runs in about 15 seconds, no network or API keys needed
+python -m pytest            # 181 tests, runs in about 15 seconds, no network or API keys needed
 ```
 
 The suite covers the graph engine (interval algebra, bi-temporal visibility), every reconciliation rule, ledger
@@ -387,6 +388,23 @@ mostly the fsync), while full-history context grows linearly to 338k tokens. Wit
 grows with the history, because every fact is scored. The optional ego-local mode keeps exactly the same facts and is
 9x faster at 11,758 facts, and hub damping holds context growth to 811 tokens instead of 1,187. Numbers are from one
 Windows laptop, CPU only; absolute values will vary, but the trends do not.
+
+## Robustness experiments
+
+```bash
+cd backend
+python experiments.py all --json results.json   # about 4 minutes, no LLM
+```
+
+| Experiment | Result (5 worlds × 60 questions, seeds 1–5) |
+|---|---|
+| Multi-seed comparison | VERITAS 100% (95% Wilson CI 98.7–100%); best baseline, full history, 73.7% (68.4–78.3%) |
+| Ablations | without source authority 79.7%; without tolerance (δ = 0) 65.0%; arrival order instead of valid time 95.3%; without pruning 100% but 22,805 tokens instead of 595 |
+| Pruning sweep | τ ≤ 0.6 keeps every needed fact; τ = 0.7 → 91.0%, 0.8 → 83.3%; recency-heavy weights 56.7%; relevance-heavy weights 100% with 399 tokens |
+| Adversarial (15% of slots get a false *system-of-record* claim) | VERITAS 82.0% (still highest; baselines 44.0–73.0%); every wrong answer still cites the ledger record that admitted the lie |
+
+The ablation options (`ReconciliationEngine(authority=...)`, `generate(lie_rate=...)`) default to the
+original behaviour.
 
 ## Entity linking
 

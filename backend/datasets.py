@@ -163,6 +163,7 @@ class _World:
         self.truth: dict[tuple[str, str], list[Interval]] = {}
         self.rumors: dict[tuple[str, str], list[str]] = {}
         self.pre_history: set[tuple[str, str]] = set()
+        self.lies: set[tuple[str, str]] = set()
 
     def current(self, slot: tuple[str, str]) -> str:
         return self.truth[slot][-1].value
@@ -208,6 +209,7 @@ def generate(
     drift: float = 0.35,
     rumor_rate: float = 0.15,
     late_rate: float = 0.15,
+    lie_rate: float = 0.0,
     max_questions: int = 60,
     seed: int = 7,
     start: datetime = datetime(2025, 1, 6, 9, 0, tzinfo=timezone.utc),
@@ -282,6 +284,15 @@ def generate(
                     text = (f"{subject} lives in {false_value}" if pred == "lives_in"
                             else _text(pred, subject, false_value, None, rng))
                     emit(k, ts, text, "hearsay", round(rng.uniform(0.55, 0.7), 2))
+            # Adversarial option: a *high-authority* source asserts a false value. Off by default, and the
+            # random stream is only consumed when enabled, so default datasets are unchanged.
+            if lie_rate > 0 and pred != "headquartered_in" and rng.random() < lie_rate:
+                false_value = world.fresh(slot, pools[pred])
+                if false_value is not None:
+                    ts = (changed_at or base) + timedelta(hours=rng.randint(210, 300))
+                    world.rumors.setdefault(slot, []).append(false_value)
+                    world.lies.add(slot)
+                    emit(k, ts, _text(pred, subject, false_value, None, rng), "system_of_record", 0.95)
 
     observations: list[ScriptedObservation] = []
     for k in range(sessions):
@@ -292,7 +303,7 @@ def generate(
     end_of_world = max(o.timestamp for o in observations)
     questions = _questions(world, slots, person_names, end_of_world, max_questions, rng)
     config = {"people": people, "orgs": len(org_names), "sessions": sessions, "session_days": session_days,
-              "drift": drift, "rumor_rate": rumor_rate, "late_rate": late_rate, "seed": seed,
+              "drift": drift, "rumor_rate": rumor_rate, "late_rate": late_rate, "lie_rate": lie_rate, "seed": seed,
               "max_questions": max_questions}
     return Dataset(observations, questions, world.truth, world.rumors, config)
 
