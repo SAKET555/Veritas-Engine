@@ -404,14 +404,21 @@ class ReconciliationEngine:
             entries.append(ProvenanceEntry(record=record, narrative=narrative))
         return ProvenanceTrail(entity=entity, entries=entries)
 
-    def replay(self) -> int:
-        """Rebuild the graph purely from ledger snapshots. Returns records applied."""
+    def replay(self, until_sequence: Optional[int] = None) -> int:
+        """Rebuild the graph purely from ledger snapshots. Returns records applied.
+
+        With ``until_sequence``, only records up to and including that sequence number are applied,
+        which reconstructs the knowledge state as it stood after that mutation (rollback by replay,
+        without touching the ledger). Use a fresh engine to inspect a past state alongside the live one.
+        """
         with self.graph.lock:
             self.graph.clear()
             applied = 0
             if self.linker is not None:
                 self.linker.clear()
             for record in self.ledger.records():
+                if until_sequence is not None and record.sequence > until_sequence:
+                    break
                 snap = record.new_state_snapshot
                 if record.mutation_type == "ALIAS":
                     if self.linker is not None:

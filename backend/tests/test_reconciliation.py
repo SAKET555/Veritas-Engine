@@ -197,3 +197,17 @@ def test_resolve_short_id(stack: Stack) -> None:
     record = out.mutations[0]
     assert stack.ledger.resolve_short_id(record.short_id) == record
     assert stack.ledger.resolve_short_id("deadbeef") is None
+
+
+def test_replay_prefix_reconstructs_past_state(stack: Stack) -> None:
+    from graph_engine import TemporalGraphEngine
+    from reconciliation import ReconciliationEngine
+
+    stack.ingest(obs("Alice", "lives_in", "Mumbai", day=0))
+    first = len(stack.ledger) - 1
+    stack.ingest(obs("Alice", "lives_in", "London", day=30))
+    past = ReconciliationEngine(TemporalGraphEngine(), stack.ledger)
+    assert past.replay(until_sequence=first) == first + 1
+    assert [e.target_id for e in past.graph.active_edges_for("alice", "lives_in")] == ["mumbai"]
+    assert [e.target_id for e in stack.graph.active_edges_for("alice", "lives_in")] == ["london"]
+    assert stack.ledger.verify().valid
